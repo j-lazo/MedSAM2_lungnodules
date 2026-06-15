@@ -1,0 +1,57 @@
+.vscode/
+.DS_Store
+__pycache__/
+*-checkpoint.ipynb
+.venv
+*.egg*
+build/*
+_C.*
+*.nii.gz
+*.csv
+outputs/*
+checkpoints/*.pt
+*.pt
+                                                                                                                  
+# Hidden files and folders
+.*
+
+# But keep this file tracked
+!.gitignore
+
+# Notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Python/cache
+__pycache__/
+*.pyc
+
+# Data/results/logs
+data*/
+results*/
+logs*/
+*.log
+*.out
+*.err
+*.so
+*.o
+*.sh
+
+# Models/checkpoints
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# Enviroment files
+*.def
+*.sif
+
+# OS/editor files
+.DS_Store
+.vscode/*
+.idea/
+
+project.def
+project.sif
+

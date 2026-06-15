@@ -1,0 +1,15 @@
+pandas
+matplotlib
+seaborn
+opencv-python
+pillow
+scipy
+scikit-image
+scikit-learn
+SimpleITK
+nibabel
+pydicom
+pynrrd
+PyYAML
+tqdm
+ipykernel
