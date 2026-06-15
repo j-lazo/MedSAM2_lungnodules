@@ -11,6 +11,10 @@ _C.*
 outputs/*
 checkpoints/*.pt
 *.pt
+
+*.pt.*
+*.ckpt.*
+*.pth.*
                                                                                                                   
 # Hidden files and folders
 .*
