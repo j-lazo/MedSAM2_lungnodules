@@ -924,14 +924,14 @@ def run_medsam2_single_object_video(
             obj_id=obj_id,
             mask=mask_prompt,
         )
-        segs_3d[frame_idx, ((masks[0] > 0.0).float().cpu().numpy())[0]] = 1
+        segs_3d[int(frame_idx), ((masks[0] > 0.0).cpu().numpy())[0].astype(bool)] = 1
 
         for out_frame_idx, _, out_mask_logits in predictor.propagate_in_video(
             inference_state,
             start_frame_idx=frame_idx,
             reverse=False,
         ):
-            segs_3d[int(out_frame_idx), (out_mask_logits[0] > 0.0).float().cpu().numpy()[0]] = 1
+            segs_3d[int(out_frame_idx), ((out_mask_logits[0] > 0.0).cpu().numpy())[0].astype(bool)] = 1
 
         if hasattr(predictor, "reset_state"):
             predictor.reset_state(inference_state)
@@ -944,7 +944,7 @@ def run_medsam2_single_object_video(
                 start_frame_idx=frame_idx,
                 reverse=True,
             ):
-                segs_3d[int(out_frame_idx), (out_mask_logits[0] > 0.0).float().cpu().numpy()[0]] = 1
+                segs_3d[int(out_frame_idx), ((out_mask_logits[0] > 0.0).cpu().numpy())[0].astype(bool)] = 1
             if hasattr(predictor, "reset_state"):
                 predictor.reset_state(inference_state)
 
