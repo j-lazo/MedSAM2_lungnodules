@@ -90,6 +90,8 @@ def build_experiment_name(args: argparse.Namespace) -> str:
         parts.append(f"max-{args.max_cases}")
     if args.prompt_perturb_rmax > 0:
         parts.append(f"perturb-r{args.prompt_perturb_rmax}")
+    if getattr(args, "box_size_perturb_px", 0) != 0:
+        parts.append(f"boxsize-{int(args.box_size_perturb_px):+d}px")
     if args.shard_count > 1:
         parts.append(f"shard-{args.shard_index}of{args.shard_count}")
     return slugify("_".join(parts))
@@ -389,6 +391,68 @@ def pad_box_xyxy(box_xyxy: np.ndarray, image_shape_hw: Tuple[int, int], pad: int
     return clip_box_xyxy(box, image_shape_hw)
 
 
+def resize_box_xyxy(
+    box_xyxy: Sequence[float],
+    image_shape_hw: Tuple[int, int],
+    delta_px: int,
+    min_size: int = 3,
+) -> np.ndarray:
+    """
+    Resize an xyxy prompt box by delta_px in every direction.
+
+    delta_px = 0 keeps the box unchanged.
+    delta_px > 0 expands the box.
+    delta_px < 0 shrinks the box.
+
+    The returned box is clipped to image bounds and forced to keep at least
+    min_size pixels of width and height, so strong negative perturbations do not
+    produce invalid boxes.
+    """
+    H, W = image_shape_hw
+    min_size = max(1, int(min_size))
+    d = int(delta_px)
+
+    original = np.asarray(box_xyxy, dtype=np.float32).reshape(4)
+    x1, y1, x2, y2 = original.tolist()
+
+    # First apply symmetric expansion/shrinkage.
+    resized = np.array([x1 - d, y1 - d, x2 + d, y2 + d], dtype=np.float32)
+
+    # If shrinking would make a side too small, rebuild that side around the
+    # original center using the requested minimum size.
+    rx1, ry1, rx2, ry2 = resized.tolist()
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+
+    if rx2 - rx1 + 1 < min_size:
+        half = (min_size - 1) / 2.0
+        rx1 = cx - half
+        rx2 = cx + half
+    if ry2 - ry1 + 1 < min_size:
+        half = (min_size - 1) / 2.0
+        ry1 = cy - half
+        ry2 = cy + half
+
+    # Shift boxes back into the image while preserving the enforced size when possible.
+    if rx1 < 0:
+        rx2 -= rx1
+        rx1 = 0.0
+    if rx2 > W - 1:
+        rx1 -= rx2 - (W - 1)
+        rx2 = float(W - 1)
+    if ry1 < 0:
+        ry2 -= ry1
+        ry1 = 0.0
+    if ry2 > H - 1:
+        ry1 -= ry2 - (H - 1)
+        ry2 = float(H - 1)
+
+    rx1 = max(0.0, rx1)
+    ry1 = max(0.0, ry1)
+
+    return clip_box_xyxy(np.array([rx1, ry1, rx2, ry2], dtype=np.float32), image_shape_hw)
+
+
 # -----------------------------------------------------------------------------
 # Dataset utilities
 # -----------------------------------------------------------------------------
@@ -563,7 +627,12 @@ def get_interior_point_2d(component_mask: np.ndarray) -> List[float]:
     return [float(x), float(y)]
 
 
-def extract_blobs_from_slice(mask_2d: np.ndarray, pad_box: int = 0) -> List[Dict]:
+def extract_blobs_from_slice(
+    mask_2d: np.ndarray,
+    pad_box: int = 0,
+    box_size_perturb_px: int = 0,
+    box_min_size_px: int = 3,
+) -> List[Dict]:
     mask_bin = (mask_2d > 0).astype(np.uint8)
     contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     H, W = mask_bin.shape
@@ -579,6 +648,13 @@ def extract_blobs_from_slice(mask_2d: np.ndarray, pad_box: int = 0) -> List[Dict
         bbox = np.array([x, y, x + w - 1, y + h - 1], dtype=np.float32)
         if pad_box > 0:
             bbox = pad_box_xyxy(bbox, image_shape_hw=(H, W), pad=pad_box)
+        if box_size_perturb_px != 0:
+            bbox = resize_box_xyxy(
+                bbox,
+                image_shape_hw=(H, W),
+                delta_px=box_size_perturb_px,
+                min_size=box_min_size_px,
+            )
         blobs.append(
             {
                 "center": get_interior_point_2d(component_mask),
@@ -591,14 +667,24 @@ def extract_blobs_from_slice(mask_2d: np.ndarray, pad_box: int = 0) -> List[Dict
     return blobs
 
 
-def build_slice_prompt_dict(mask_3d: np.ndarray, pad_box: int = 0) -> List[Dict]:
+def build_slice_prompt_dict(
+    mask_3d: np.ndarray,
+    pad_box: int = 0,
+    box_size_perturb_px: int = 0,
+    box_min_size_px: int = 3,
+) -> List[Dict]:
     mask_3d = (mask_3d > 0).astype(np.uint8)
     slice_dicts = []
     for z in range(mask_3d.shape[0]):
         mask_slice = mask_3d[z]
         if not np.any(mask_slice > 0):
             continue
-        blobs = extract_blobs_from_slice(mask_slice, pad_box=pad_box)
+        blobs = extract_blobs_from_slice(
+            mask_slice,
+            pad_box=pad_box,
+            box_size_perturb_px=box_size_perturb_px,
+            box_min_size_px=box_min_size_px,
+        )
         if not blobs:
             continue
         slice_dicts.append(
@@ -632,7 +718,12 @@ def get_bbox_from_2d_mask(mask_2d: np.ndarray) -> Optional[np.ndarray]:
     return np.array([xs.min(), ys.min(), xs.max(), ys.max()], dtype=np.float32)
 
 
-def extract_nodule_prompts_from_3d_mask(mask_zyx: np.ndarray, pad_box: int = 5) -> List[Dict]:
+def extract_nodule_prompts_from_3d_mask(
+    mask_zyx: np.ndarray,
+    pad_box: int = 5,
+    box_size_perturb_px: int = 0,
+    box_min_size_px: int = 3,
+) -> List[Dict]:
     labeled, num = get_3d_connected_components(mask_zyx)
     prompts = []
     obj_id = 1
@@ -647,6 +738,13 @@ def extract_nodule_prompts_from_3d_mask(mask_zyx: np.ndarray, pad_box: int = 5) 
             continue
         if pad_box > 0:
             box_xyxy = pad_box_xyxy(box_xyxy, image_shape_hw=(H, W), pad=pad_box)
+        if box_size_perturb_px != 0:
+            box_xyxy = resize_box_xyxy(
+                box_xyxy,
+                image_shape_hw=(H, W),
+                delta_px=box_size_perturb_px,
+                min_size=box_min_size_px,
+            )
         prompts.append(
             {
                 "obj_id": obj_id,
@@ -746,7 +844,12 @@ def predict_image_single(
     args: argparse.Namespace,
     device: torch.device,
 ) -> Tuple[Dict, Dict[str, np.ndarray]]:
-    prompts = build_slice_prompt_dict(gt_volume, pad_box=args.image_pad_box)
+    prompts = build_slice_prompt_dict(
+        gt_volume,
+        pad_box=args.image_pad_box,
+        box_size_perturb_px=args.box_size_perturb_px,
+        box_min_size_px=args.box_min_size_px,
+    )
     prompts = perturb_slice_prompt_dicts(
         prompts,
         series_id=series_id,
@@ -805,7 +908,12 @@ def predict_image_multi(
     args: argparse.Namespace,
     device: torch.device,
 ) -> Tuple[Dict, Dict[str, np.ndarray]]:
-    prompts = build_slice_prompt_dict(gt_volume, pad_box=args.image_pad_box)
+    prompts = build_slice_prompt_dict(
+        gt_volume,
+        pad_box=args.image_pad_box,
+        box_size_perturb_px=args.box_size_perturb_px,
+        box_min_size_px=args.box_min_size_px,
+    )
     prompts = perturb_slice_prompt_dicts(
         prompts,
         series_id=series_id,
@@ -959,7 +1067,12 @@ def predict_video(
     args: argparse.Namespace,
     device: torch.device,
 ) -> Tuple[Dict, Dict[str, np.ndarray]]:
-    prompts = extract_nodule_prompts_from_3d_mask(gt_volume, pad_box=args.video_pad_box)
+    prompts = extract_nodule_prompts_from_3d_mask(
+        gt_volume,
+        pad_box=args.video_pad_box,
+        box_size_perturb_px=args.box_size_perturb_px,
+        box_min_size_px=args.box_min_size_px,
+    )
     prompts = perturb_3d_nodule_prompts(
         prompts,
         series_id=series_id,
@@ -1064,6 +1177,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--image-pad-box", type=int, default=0, help="Padding in pixels around slice-wise image-mode boxes.")
     parser.add_argument("--video-pad-box", type=int, default=5, help="Padding in pixels around video-mode center-slice boxes.")
+    parser.add_argument(
+        "--box-size-perturb-px",
+        type=int,
+        default=0,
+        help=(
+            "Resize prompt boxes by this many pixels in every direction. "
+            "0 keeps the original/padded box, positive values enlarge it, negative values shrink it."
+        ),
+    )
+    parser.add_argument(
+        "--box-min-size-px",
+        type=int,
+        default=3,
+        help="Minimum side length in pixels after box-size perturbation. Prevents invalid/tiny boxes when shrinking.",
+    )
 
     # Video-specific options
     parser.add_argument("--video-imsize", type=int, default=512, help="MedSAM2 video tensor spatial size.")
@@ -1117,6 +1245,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--prompt-perturb-rmax must be >= 0")
     if args.image_pad_box < 0 or args.video_pad_box < 0:
         raise ValueError("box padding values must be >= 0")
+    if args.box_min_size_px < 1:
+        raise ValueError("--box-min-size-px must be >= 1")
     return args
 
 
@@ -1197,6 +1327,8 @@ def main() -> None:
                     "width": int(gt_volume.shape[2]),
                     "prompt_perturb_rmax": int(args.prompt_perturb_rmax),
                     "prompt_perturb_seed": int(args.seed),
+                    "box_size_perturb_px": int(args.box_size_perturb_px),
+                    "box_min_size_px": int(args.box_min_size_px),
                 }
             )
             rows.append(row)
