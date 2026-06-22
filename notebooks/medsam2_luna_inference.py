@@ -90,6 +90,10 @@ def build_experiment_name(args: argparse.Namespace) -> str:
         parts.append(f"max-{args.max_cases}")
     if args.prompt_perturb_rmax > 0:
         parts.append(f"perturb-r{args.prompt_perturb_rmax}")
+    if getattr(args, "video_z_perturb_rmax", 0) > 0:
+        parts.append(f"zperturb-r{int(args.video_z_perturb_rmax)}")
+        if getattr(args, "video_z_perturb_only", False):
+            parts.append("zonly")
     if getattr(args, "box_size_perturb_px", 0) != 0:
         parts.append(f"boxsize-{int(args.box_size_perturb_px):+d}px")
     if args.shard_count > 1:
@@ -316,6 +320,31 @@ def sample_prompt_shift_xy(
     rng = np.random.default_rng(seed)
     dx, dy = rng.integers(-rmax, rmax + 1, size=2, endpoint=False)
     return int(dx), int(dy)
+
+
+def sample_prompt_shift_z(
+    base_seed: int,
+    series_id: str,
+    prompt_scope: str,
+    z: int,
+    prompt_index: int,
+    rmax: int,
+) -> int:
+    """Deterministically sample an integer z/frame shift in [-rmax, +rmax]."""
+    rmax = int(rmax)
+    if rmax <= 0:
+        return 0
+    seed = stable_uint32_seed(base_seed, series_id, prompt_scope, z, prompt_index, "z", rmax)
+    rng = np.random.default_rng(seed)
+    dz = rng.integers(-rmax, rmax + 1)
+    return int(dz)
+
+
+def clip_z_index(z: int, num_slices: int) -> int:
+    """Clip a z/frame index to valid volume bounds."""
+    if num_slices <= 0:
+        raise ValueError("num_slices must be > 0")
+    return int(np.clip(int(z), 0, int(num_slices) - 1))
 
 
 def clip_point_xy(point_xy: np.ndarray, image_shape_hw: Tuple[int, int]) -> np.ndarray:
@@ -795,22 +824,53 @@ def perturb_3d_nodule_prompts(
     image_shape_hw: Tuple[int, int],
     rmax: int,
     seed: int,
+    z_rmax: int = 0,
+    num_slices: Optional[int] = None,
 ) -> List[Dict]:
+    """
+    Apply deterministic perturbations to video-mode 3D object prompts.
+
+    x/y perturbation is controlled by rmax and behaves as before: the point is
+    shifted in-plane and the box is recentered around the shifted point.
+
+    z perturbation is controlled independently by z_rmax: the prompt frame index
+    is shifted by dz in [-z_rmax, +z_rmax] and clipped to [0, num_slices - 1].
+    The x/y coordinates and box size are not changed by z perturbation itself,
+    so setting --prompt-perturb-rmax 0 and --video-z-perturb-rmax N gives a
+    pure z-only prompt perturbation around the original central slice.
+    """
     rmax = int(rmax)
-    if rmax <= 0:
+    z_rmax = int(z_rmax)
+    if rmax <= 0 and z_rmax <= 0:
         return prompts
+    if z_rmax > 0 and num_slices is None:
+        raise ValueError("num_slices is required when z_rmax > 0")
+
     perturbed = []
     for p in prompts:
         new_p = dict(p)
-        z = int(p["frame_idx"])
+        original_z = int(p["frame_idx"])
         obj_id = int(p["obj_id"])
-        dx, dy = sample_prompt_shift_xy(seed, series_id, "video-object", z, obj_id, rmax)
+
+        dz = sample_prompt_shift_z(seed, series_id, "video-object", original_z, obj_id, z_rmax) if z_rmax > 0 else 0
+        z = clip_z_index(original_z + dz, int(num_slices)) if z_rmax > 0 else original_z
+
+        dx, dy = sample_prompt_shift_xy(seed, series_id, "video-object", original_z, obj_id, rmax) if rmax > 0 else (0, 0)
         point = np.asarray(p["point_xy"], dtype=np.float32).copy()
         shifted = clip_point_xy(point + np.array([[dx, dy]], dtype=np.float32), image_shape_hw)
+
+        new_p["frame_idx"] = int(z)
         new_p["point_xy"] = shifted
-        new_p["box_xyxy"] = recenter_box_xyxy_at_point(p["box_xyxy"], shifted[0], image_shape_hw)
+        new_p["box_xyxy"] = recenter_box_xyxy_at_point(p["box_xyxy"], shifted[0], image_shape_hw) if rmax > 0 else np.asarray(p["box_xyxy"], dtype=np.float32)
         new_p["perturb_shift_xy"] = (dx, dy)
-        new_p["center_zyx_perturbed"] = (z, int(round(float(shifted[0, 1]))), int(round(float(shifted[0, 0]))))
+        new_p["perturb_shift_z"] = int(dz)
+        new_p["perturb_shift_zyx"] = (int(dz), int(dy), int(dx))
+        new_p["frame_idx_original"] = int(original_z)
+        new_p["center_zyx_perturbed"] = (
+            int(z),
+            int(round(float(shifted[0, 1]))),
+            int(round(float(shifted[0, 0]))),
+        )
         perturbed.append(new_p)
     return perturbed
 
@@ -1077,8 +1137,10 @@ def predict_video(
         prompts,
         series_id=series_id,
         image_shape_hw=gt_volume.shape[1:],
-        rmax=args.prompt_perturb_rmax,
+        rmax=0 if args.video_z_perturb_only else args.prompt_perturb_rmax,
         seed=args.seed,
+        z_rmax=args.video_z_perturb_rmax,
+        num_slices=gt_volume.shape[0],
     )
     if not prompts:
         raise ValueError("No 3D connected nodules found in mask")
@@ -1175,6 +1237,26 @@ def parse_args() -> argparse.Namespace:
             "recentered box are shared by point, box, and point+box modes. Use 0 to disable."
         ),
     )
+    parser.add_argument(
+        "--video-z-perturb-rmax",
+        type=int,
+        default=0,
+        help=(
+            "Video/volume mode only: maximum absolute deterministic random perturbation "
+            "of the prompt frame index. dz is sampled from [-rmax, +rmax] around "
+            "the original central slice and clipped to valid z bounds. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--video-z-perturb-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Video/volume mode only: apply z perturbation without applying x/y prompt "
+            "perturbation, even if --prompt-perturb-rmax is > 0. For a pure z-only "
+            "experiment, you can also simply keep --prompt-perturb-rmax 0."
+        ),
+    )
     parser.add_argument("--image-pad-box", type=int, default=0, help="Padding in pixels around slice-wise image-mode boxes.")
     parser.add_argument("--video-pad-box", type=int, default=5, help="Padding in pixels around video-mode center-slice boxes.")
     parser.add_argument(
@@ -1243,6 +1325,10 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.prompt_perturb_rmax < 0:
         raise ValueError("--prompt-perturb-rmax must be >= 0")
+    if args.video_z_perturb_rmax < 0:
+        raise ValueError("--video-z-perturb-rmax must be >= 0")
+    if args.video_z_perturb_only and args.video_z_perturb_rmax <= 0:
+        raise ValueError("--video-z-perturb-only requires --video-z-perturb-rmax > 0")
     if args.image_pad_box < 0 or args.video_pad_box < 0:
         raise ValueError("box padding values must be >= 0")
     if args.box_min_size_px < 1:
@@ -1327,6 +1413,8 @@ def main() -> None:
                     "width": int(gt_volume.shape[2]),
                     "prompt_perturb_rmax": int(args.prompt_perturb_rmax),
                     "prompt_perturb_seed": int(args.seed),
+                    "video_z_perturb_rmax": int(args.video_z_perturb_rmax),
+                    "video_z_perturb_only": bool(args.video_z_perturb_only),
                     "box_size_perturb_px": int(args.box_size_perturb_px),
                     "box_min_size_px": int(args.box_min_size_px),
                 }
