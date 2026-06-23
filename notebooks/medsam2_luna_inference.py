@@ -1212,57 +1212,30 @@ def parse_args() -> argparse.Namespace:
 
     # Mode selection
     parser.add_argument("--mode", choices=["video", "image-single", "image-multi"], required=True)
-    parser.add_argument(
-        "--prompt-modes",
-        nargs="+",
-        choices=PROMPT_MODES,
-        default=["point", "box", "point+box"],
-        help="Prompt modes for video mode.",
-    )
-    parser.add_argument(
-        "--image-outputs",
-        nargs="+",
-        choices=PROMPT_MODES,
-        default=["point", "box", "point+box"],
-        help="Prompted outputs for image-single/image-multi.",
-    )
+    parser.add_argument("--prompt-modes", nargs="+", choices=PROMPT_MODES, default=["point", "box", "point+box"], help="Prompt modes for video mode.",)
+    parser.add_argument("--image-outputs", nargs="+", choices=PROMPT_MODES, default=["point", "box", "point+box"], help="Prompted outputs for image-single/image-multi.",)
     parser.add_argument("--use-triplet-channels", action="store_true", help="Use z-1/z/z+1 as RGB channels instead of duplicated slice.")
-    parser.add_argument(
-        "--prompt-perturb-rmax",
-        type=int,
-        default=0,
-        help=(
+    parser.add_argument("--prompt-perturb-rmax", type=int, default=0, help=(
             "Maximum absolute deterministic random perturbation in pixels for prompted point/box inputs. "
             "For each prompt, dx and dy are sampled from [-rmax, +rmax]. The shifted point and "
             "recentered box are shared by point, box, and point+box modes. Use 0 to disable."
-        ),
-    )
-    parser.add_argument(
-        "--video-z-perturb-rmax",
-        type=int,
-        default=0,
+        ),)
+    parser.add_argument("--video-z-perturb-rmax", type=int, default=0,
         help=(
             "Video/volume mode only: maximum absolute deterministic random perturbation "
             "of the prompt frame index. dz is sampled from [-rmax, +rmax] around "
             "the original central slice and clipped to valid z bounds. Use 0 to disable."
         ),
     )
-    parser.add_argument(
-        "--video-z-perturb-only",
-        action=argparse.BooleanOptionalAction,
-        default=False,
+    parser.add_argument("--video-z-perturb-only", action=argparse.BooleanOptionalAction, default=False,
         help=(
             "Video/volume mode only: apply z perturbation without applying x/y prompt "
             "perturbation, even if --prompt-perturb-rmax is > 0. For a pure z-only "
             "experiment, you can also simply keep --prompt-perturb-rmax 0."
-        ),
-    )
+        ),)
     parser.add_argument("--image-pad-box", type=int, default=0, help="Padding in pixels around slice-wise image-mode boxes.")
     parser.add_argument("--video-pad-box", type=int, default=5, help="Padding in pixels around video-mode center-slice boxes.")
-    parser.add_argument(
-        "--box-size-perturb-px",
-        type=int,
-        default=0,
+    parser.add_argument("--box-size-perturb-px", type=int, default=0,
         help=(
             "Resize prompt boxes by this many pixels in every direction. "
             "0 keeps the original/padded box, positive values enlarge it, negative values shrink it."
