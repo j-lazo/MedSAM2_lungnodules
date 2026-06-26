@@ -114,10 +114,14 @@ def make_output_dir(args: argparse.Namespace) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         triplet = "2p5d" if args.use_triplet_channels else "2d_rgbcopy"
         size = f"sz{args.image_size}" if args.image_size else "native"
+        decoder = getattr(args, "decoder_type", "simple")
+        aug = "aug" if getattr(args, "augment", False) else "noaug"
         name = args.experiment_name or "_".join(
             [
                 stamp,
                 "medsam2_posslice_seg",
+                decoder,
+                aug,
                 triplet,
                 size,
                 f"ep{args.epochs}",
@@ -305,6 +309,84 @@ def resize_rgb_and_mask(rgb: np.ndarray, mask: np.ndarray, image_size: Optional[
     rgb_r = cv2.resize(rgb, size, interpolation=cv2.INTER_LINEAR)
     mask_r = cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST)
     return rgb_r, mask_r
+
+
+def build_augment_params(args: argparse.Namespace) -> Dict:
+    return {
+        "enabled": bool(args.augment),
+        "hflip_p": float(args.aug_hflip_p),
+        "vflip_p": float(args.aug_vflip_p),
+        "rotation_deg": float(args.aug_rotation_deg),
+        "shift_px": float(args.aug_shift_px),
+        "scale_min": float(args.aug_scale_min),
+        "scale_max": float(args.aug_scale_max),
+        "intensity_p": float(args.aug_intensity_p),
+        "brightness": float(args.aug_brightness),
+        "contrast": float(args.aug_contrast),
+        "noise_std": float(args.aug_noise_std),
+        "blur_p": float(args.aug_blur_p),
+    }
+
+
+def apply_train_augmentations(rgb: np.ndarray, mask: np.ndarray, params: Dict) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply lightweight CT-safe 2D augmentations to one resized slice/mask pair.
+
+    Geometric transforms are shared by image and mask. Intensity transforms are
+    applied only to the image. The image remains uint8 H,W,3 and mask remains
+    uint8 H,W. This is intentionally conservative for small nodule masks.
+    """
+    if not params or not params.get("enabled", False):
+        return rgb, mask
+
+    rgb = np.ascontiguousarray(rgb)
+    mask = np.ascontiguousarray(mask.astype(np.uint8))
+
+    if random.random() < params.get("hflip_p", 0.0):
+        rgb = np.ascontiguousarray(rgb[:, ::-1])
+        mask = np.ascontiguousarray(mask[:, ::-1])
+    if random.random() < params.get("vflip_p", 0.0):
+        rgb = np.ascontiguousarray(rgb[::-1, :])
+        mask = np.ascontiguousarray(mask[::-1, :])
+
+    H, W = mask.shape[:2]
+    rot = float(params.get("rotation_deg", 0.0))
+    shift = float(params.get("shift_px", 0.0))
+    scale_min = float(params.get("scale_min", 1.0))
+    scale_max = float(params.get("scale_max", 1.0))
+    if rot > 0 or shift > 0 or abs(scale_min - 1.0) > 1e-6 or abs(scale_max - 1.0) > 1e-6:
+        angle = random.uniform(-rot, rot) if rot > 0 else 0.0
+        scale = random.uniform(scale_min, scale_max) if scale_max > 0 else 1.0
+        tx = random.uniform(-shift, shift) if shift > 0 else 0.0
+        ty = random.uniform(-shift, shift) if shift > 0 else 0.0
+        M = cv2.getRotationMatrix2D((W / 2.0, H / 2.0), angle, scale)
+        M[0, 2] += tx
+        M[1, 2] += ty
+        rgb = cv2.warpAffine(
+            rgb, M, (W, H), flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        mask = cv2.warpAffine(
+            mask, M, (W, H), flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+
+    if random.random() < params.get("intensity_p", 0.0):
+        x = rgb.astype(np.float32)
+        contrast = float(params.get("contrast", 0.0))
+        brightness = float(params.get("brightness", 0.0))
+        if contrast > 0:
+            x *= random.uniform(1.0 - contrast, 1.0 + contrast)
+        if brightness > 0:
+            x += random.uniform(-brightness, brightness) * 255.0
+        noise_std = float(params.get("noise_std", 0.0))
+        if noise_std > 0:
+            x += np.random.normal(0.0, noise_std * 255.0, size=x.shape).astype(np.float32)
+        rgb = np.clip(x, 0.0, 255.0).astype(np.uint8)
+
+    if random.random() < params.get("blur_p", 0.0):
+        rgb = cv2.GaussianBlur(rgb, ksize=(3, 3), sigmaX=0.0)
+
+    return rgb.astype(np.uint8), (mask > 0).astype(np.uint8)
 
 
 def numpy_rgb_to_tensor(rgb: np.ndarray) -> torch.Tensor:
@@ -561,6 +643,7 @@ class PositiveSliceSegDataset(Dataset):
         min_slice_mask_pixels: int,
         image_size: Optional[int] = None,
         cache_cases: bool = False,
+        augment_params: Optional[Dict] = None,
         desc: str = "dataset",
     ):
         self.index = index
@@ -571,6 +654,7 @@ class PositiveSliceSegDataset(Dataset):
         self.min_slice_mask_pixels = min_slice_mask_pixels
         self.image_size = image_size
         self.cache_cases = cache_cases
+        self.augment_params = augment_params or {"enabled": False}
         self._case_cache: Dict[str, CaseData] = {}
         self.samples = self._build_samples(desc=desc)
         if len(self.samples) == 0:
@@ -614,6 +698,7 @@ class PositiveSliceSegDataset(Dataset):
         mask = case.gt_volume[s.z].astype(np.uint8)
         orig_hw = mask.shape
         rgb, mask = resize_rgb_and_mask(rgb, mask, self.image_size)
+        rgb, mask = apply_train_augmentations(rgb, mask, self.augment_params)
         return {
             "image": numpy_rgb_to_tensor(rgb),
             "mask": numpy_mask_to_tensor(mask),
@@ -639,43 +724,158 @@ def collate_seg(batch: List[Dict]) -> Dict:
 
 
 class ConvGNAct(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, groups: int = 8):
+    def __init__(self, in_ch: int, out_ch: int, groups: int = 8, dropout: float = 0.0):
         super().__init__()
         g = min(groups, out_ch)
         while out_ch % g != 0 and g > 1:
             g -= 1
-        self.net = nn.Sequential(
+        layers: List[nn.Module] = [
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
             nn.GroupNorm(g, out_ch),
             nn.SiLU(inplace=True),
-        )
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout2d(p=float(dropout)))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
-class MedSAM2EncoderSegmentationModel(nn.Module):
-    """Promptless segmentation model: MedSAM2/SAM2 image encoder + small full-resolution segmentation head."""
+class LazyConvGNAct(nn.Module):
+    """Lazy 1x1 projection followed by GroupNorm and activation."""
 
-    def __init__(self, sam2_model: nn.Module, decoder_dim: int = 256, freeze_encoder: bool = True):
+    def __init__(self, out_ch: int, groups: int = 8, dropout: float = 0.0):
+        super().__init__()
+        g = min(groups, out_ch)
+        while out_ch % g != 0 and g > 1:
+            g -= 1
+        layers: List[nn.Module] = [
+            nn.LazyConv2d(out_ch, kernel_size=1),
+            nn.GroupNorm(g, out_ch),
+            nn.SiLU(inplace=True),
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout2d(p=float(dropout)))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class SimpleDecoder(nn.Module):
+    """Original lightweight decoder: project final SAM2 feature, refine, predict."""
+
+    def __init__(self, decoder_dim: int = 256, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            LazyConvGNAct(decoder_dim, dropout=dropout),
+            ConvGNAct(decoder_dim, decoder_dim, dropout=dropout),
+            ConvGNAct(decoder_dim, decoder_dim, dropout=dropout),
+            nn.Conv2d(decoder_dim, 1, kernel_size=1),
+        )
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return self.net(feat)
+
+
+class DeepDecoder(nn.Module):
+    """Deeper low-resolution decoder using the final SAM2 image feature only."""
+
+    def __init__(self, decoder_dim: int = 256, depth: int = 4, dropout: float = 0.0):
+        super().__init__()
+        depth = max(1, int(depth))
+        layers: List[nn.Module] = [LazyConvGNAct(decoder_dim, dropout=dropout)]
+        for _ in range(depth):
+            layers.append(ConvGNAct(decoder_dim, decoder_dim, dropout=dropout))
+        layers.append(nn.Conv2d(decoder_dim, 1, kernel_size=1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return self.net(feat)
+
+
+class FPNDecoder(nn.Module):
+    """Top-down FPN-like decoder over multiple MedSAM2/SAM2 backbone features.
+
+    Features are expected in low-to-high spatial resolution order. Each feature is
+    projected to decoder_dim with a lazy 1x1 conv, then higher-resolution features
+    are fused top-down with bilinear upsampling and smoothing convolutions.
+    """
+
+    def __init__(self, decoder_dim: int = 256, num_levels: int = 3, smooth_blocks: int = 1, dropout: float = 0.0):
+        super().__init__()
+        self.num_levels = max(1, int(num_levels))
+        self.lateral_convs = nn.ModuleList([nn.LazyConv2d(decoder_dim, kernel_size=1) for _ in range(self.num_levels)])
+        self.smooth_convs = nn.ModuleList()
+        smooth_blocks = max(1, int(smooth_blocks))
+        for _ in range(self.num_levels):
+            blocks: List[nn.Module] = []
+            for _ in range(smooth_blocks):
+                blocks.append(ConvGNAct(decoder_dim, decoder_dim, dropout=dropout))
+            self.smooth_convs.append(nn.Sequential(*blocks))
+        self.out_conv = nn.Conv2d(decoder_dim, 1, kernel_size=1)
+
+    def forward(self, features: Sequence[torch.Tensor]) -> torch.Tensor:
+        if not features:
+            raise ValueError("FPNDecoder received an empty feature list")
+        # Sort low -> high resolution. If there are more levels than requested,
+        # keep the highest-resolution range available while still preserving order.
+        feats = sorted(list(features), key=lambda t: int(t.shape[-2]) * int(t.shape[-1]))
+        if len(feats) < self.num_levels:
+            raise ValueError(
+                f"FPN requested {self.num_levels} feature levels, but SAM2 returned only {len(feats)}. "
+                "Lower --fpn-levels or use --decoder-type deep/simple."
+            )
+        if len(feats) > self.num_levels:
+            feats = feats[-self.num_levels:]
+        n = len(feats)
+        y = self.lateral_convs[0](feats[0])
+        y = self.smooth_convs[0](y)
+        for i in range(1, n):
+            lateral = self.lateral_convs[i](feats[i])
+            y = F.interpolate(y, size=lateral.shape[-2:], mode="bilinear", align_corners=False)
+            y = y + lateral
+            y = self.smooth_convs[i](y)
+        return self.out_conv(y)
+
+
+class MedSAM2EncoderSegmentationModel(nn.Module):
+    """Promptless segmentation model: MedSAM2/SAM2 image encoder + selectable decoder/head."""
+
+    def __init__(
+        self,
+        sam2_model: nn.Module,
+        decoder_dim: int = 256,
+        freeze_encoder: bool = True,
+        decoder_type: str = "simple",
+        decoder_depth: int = 4,
+        fpn_levels: int = 3,
+        decoder_dropout: float = 0.0,
+    ):
         super().__init__()
         self.sam2 = sam2_model
         self.freeze_encoder = freeze_encoder
+        self.decoder_type = str(decoder_type)
         if freeze_encoder:
             for p in self.sam2.parameters():
                 p.requires_grad = False
 
-        # Lazy first conv makes this independent of the SAM2 encoder variant.
-        self.decoder = nn.Sequential(
-            nn.LazyConv2d(decoder_dim, kernel_size=1),
-            nn.GroupNorm(8, decoder_dim),
-            nn.SiLU(inplace=True),
-            ConvGNAct(decoder_dim, decoder_dim),
-            ConvGNAct(decoder_dim, decoder_dim),
-            nn.Conv2d(decoder_dim, 1, kernel_size=1),
-        )
+        if self.decoder_type == "simple":
+            self.decoder = SimpleDecoder(decoder_dim=decoder_dim, dropout=decoder_dropout)
+        elif self.decoder_type == "deep":
+            self.decoder = DeepDecoder(decoder_dim=decoder_dim, depth=decoder_depth, dropout=decoder_dropout)
+        elif self.decoder_type == "fpn":
+            self.decoder = FPNDecoder(
+                decoder_dim=decoder_dim,
+                num_levels=fpn_levels,
+                smooth_blocks=decoder_depth,
+                dropout=decoder_dropout,
+            )
+        else:
+            raise ValueError(f"Unknown decoder_type={decoder_type!r}. Use simple, deep, or fpn.")
 
-    def extract_sam2_feature(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_backbone(self, x: torch.Tensor):
         if self.freeze_encoder:
             with torch.no_grad():
                 backbone_out = self.sam2.forward_image(x)
@@ -683,18 +883,38 @@ class MedSAM2EncoderSegmentationModel(nn.Module):
         else:
             backbone_out = self.sam2.forward_image(x)
             _, vision_feats, _, feat_sizes = self.sam2._prepare_backbone_features(backbone_out)
+        return vision_feats, feat_sizes
 
+    @staticmethod
+    def _reshape_sam2_feature(feat: torch.Tensor, feat_size: Sequence[int], batch_size: int) -> torch.Tensor:
+        h, w = int(feat_size[0]), int(feat_size[1])
+        # SAM2 commonly returns flattened features as [H*W, B, C].
+        if feat.ndim == 3 and feat.shape[1] == batch_size:
+            c = int(feat.shape[-1])
+            return feat.permute(1, 2, 0).reshape(batch_size, c, h, w).contiguous()
+        # Safety fallback for already batched features.
+        if feat.ndim == 4 and feat.shape[0] == batch_size:
+            return feat.contiguous()
+        raise RuntimeError(f"Unexpected SAM2 feature shape {tuple(feat.shape)} for batch_size={batch_size}, feat_size={feat_size}")
+
+    def extract_sam2_feature(self, x: torch.Tensor) -> torch.Tensor:
+        vision_feats, feat_sizes = self._forward_backbone(x)
         feat = vision_feats[-1]
-        b = x.shape[0]
-        c = feat.shape[-1]
-        h, w = feat_sizes[-1]
-        feat = feat.permute(1, 2, 0).reshape(b, c, h, w).contiguous()
-        return feat
+        return self._reshape_sam2_feature(feat, feat_sizes[-1], x.shape[0])
+
+    def extract_sam2_features(self, x: torch.Tensor) -> List[torch.Tensor]:
+        vision_feats, feat_sizes = self._forward_backbone(x)
+        feats = [self._reshape_sam2_feature(f, s, x.shape[0]) for f, s in zip(vision_feats, feat_sizes)]
+        return sorted(feats, key=lambda t: int(t.shape[-2]) * int(t.shape[-1]))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_hw = x.shape[-2:]
-        feat = self.extract_sam2_feature(x)
-        logits_low = self.decoder(feat)
+        if self.decoder_type == "fpn":
+            feats = self.extract_sam2_features(x)
+            logits_low = self.decoder(feats)
+        else:
+            feat = self.extract_sam2_feature(x)
+            logits_low = self.decoder(feat)
         logits = F.interpolate(logits_low, size=input_hw, mode="bilinear", align_corners=False)
         return logits
 
@@ -713,11 +933,15 @@ def load_builder(builder: str):
 
 def build_model(args: argparse.Namespace, device: torch.device) -> MedSAM2EncoderSegmentationModel:
     builder_fn = load_builder(args.builder)
-    backbone = builder_fn(args.model_cfg, args.checkpoint, device=device)
+    sam2 = builder_fn(args.model_cfg, args.checkpoint, device=device)
     model = MedSAM2EncoderSegmentationModel(
-        sam2_model=backbone,
+        sam2_model=sam2,
         decoder_dim=args.decoder_dim,
         freeze_encoder=not args.unfreeze_encoder,
+        decoder_type=args.decoder_type,
+        decoder_depth=args.decoder_depth,
+        fpn_levels=args.fpn_levels,
+        decoder_dropout=args.decoder_dropout,
     ).to(device)
     return model
 
@@ -1174,6 +1398,7 @@ def train(args: argparse.Namespace) -> None:
         min_slice_mask_pixels=args.min_slice_mask_pixels,
         image_size=args.image_size,
         cache_cases=args.cache_cases,
+        augment_params=build_augment_params(args),
         desc="train",
     )
     val_ids_for_loader = splits["val"] if splits["val"] else splits["train"]
@@ -1186,6 +1411,7 @@ def train(args: argparse.Namespace) -> None:
         min_slice_mask_pixels=args.min_slice_mask_pixels,
         image_size=args.image_size,
         cache_cases=args.cache_cases,
+        augment_params={"enabled": False},
         desc="val",
     )
 
@@ -1222,6 +1448,8 @@ def train(args: argparse.Namespace) -> None:
     metrics_rows: List[Dict] = []
 
     print(f"Training positive-slice segmentation. Output: {out_dir}")
+    print(f"Decoder: {args.decoder_type}; decoder_dim={args.decoder_dim}; decoder_depth={args.decoder_depth}; fpn_levels={args.fpn_levels}; dropout={args.decoder_dropout}")
+    print(f"Augmentation enabled: {args.augment}")
     print(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
     for epoch in range(1, args.epochs + 1):
         train_log = run_epoch(
@@ -1307,7 +1535,7 @@ def train(args: argparse.Namespace) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Fully supervised MedSAM2/SAM2-encoder positive-slice 2.5D LUNA nodule segmentation",
+        description="Fully supervised MedSAM2/MedSAM2/SAM2-encoder positive-slice 2.5D LUNA nodule segmentation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -1330,11 +1558,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--shuffle", action="store_true", help="Shuffle global case order before optional dataset_fraction/max_cases filtering.")
     p.add_argument("--seed", type=int, default=123)
 
-    # MedSAM2/SAM2 model
+    # MedSAM2/MedSAM2/SAM2 model
     p.add_argument("--model-cfg", required=True)
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--builder", default="sam2.build_sam:build_sam2", help="Model builder import path. Your uploaded MedSAM2 code uses sam2.build_sam:build_sam2, so this is the default.")
+    p.add_argument("--builder", default="sam2.build_sam:build_sam2", help="Model builder import path. Default works for MedSAM2/SAM2 repos exposing build_sam2 via sam2.build_sam.")
+    p.add_argument("--decoder-type", choices=["simple", "deep", "fpn"], default="simple", help="Segmentation decoder/head. simple keeps the original head, deep uses more conv blocks on the final feature, fpn fuses multiple MedSAM2/SAM2 features top-down.")
     p.add_argument("--decoder-dim", type=int, default=256)
+    p.add_argument("--decoder-depth", type=int, default=4, help="For deep: number of ConvGNAct blocks. For fpn: number of smoothing ConvGNAct blocks per FPN level.")
+    p.add_argument("--fpn-levels", type=int, default=3, help="Number of MedSAM2/SAM2 backbone feature levels to fuse when --decoder-type fpn.")
+    p.add_argument("--decoder-dropout", type=float, default=0.0, help="Optional Dropout2d probability inside decoder blocks.")
     p.add_argument("--unfreeze-encoder", action="store_true", help="Fine-tune the SAM2 image encoder as well as the segmentation head.")
 
     # Image/slice setup
@@ -1362,6 +1594,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--amp-dtype", choices=["bf16", "fp16", "none"], default="bf16")
     p.add_argument("--allow-tf32", action=argparse.BooleanOptionalAction, default=True)
 
+    # Augmentation; applied only to the training split, after optional resize.
+    p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False, help="Enable conservative 2D augmentations for training slices only.")
+    p.add_argument("--aug-hflip-p", type=float, default=0.5)
+    p.add_argument("--aug-vflip-p", type=float, default=0.5)
+    p.add_argument("--aug-rotation-deg", type=float, default=15.0)
+    p.add_argument("--aug-shift-px", type=float, default=16.0)
+    p.add_argument("--aug-scale-min", type=float, default=0.90)
+    p.add_argument("--aug-scale-max", type=float, default=1.10)
+    p.add_argument("--aug-intensity-p", type=float, default=0.8)
+    p.add_argument("--aug-brightness", type=float, default=0.10, help="Brightness jitter as a fraction of 255.")
+    p.add_argument("--aug-contrast", type=float, default=0.10, help="Contrast jitter fraction around 1.0.")
+    p.add_argument("--aug-noise-std", type=float, default=0.02, help="Gaussian noise std as a fraction of 255.")
+    p.add_argument("--aug-blur-p", type=float, default=0.10, help="Probability of mild 3x3 Gaussian blur.")
+
     # Outputs/evaluation
     p.add_argument("--output-dir", required=True)
     p.add_argument("--create-experiment-dir", action=argparse.BooleanOptionalAction, default=True)
@@ -1388,6 +1634,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--image-size must be positive when provided")
     if args.bce_weight < 0 or args.dice_weight < 0 or (args.bce_weight + args.dice_weight) <= 0:
         raise ValueError("Need non-negative --bce-weight/--dice-weight and at least one positive loss weight")
+    if args.decoder_depth < 1:
+        raise ValueError("--decoder-depth must be >= 1")
+    if args.fpn_levels < 1:
+        raise ValueError("--fpn-levels must be >= 1")
+    if not (0.0 <= args.decoder_dropout < 1.0):
+        raise ValueError("--decoder-dropout must be in [0, 1)")
+    if args.aug_scale_min <= 0 or args.aug_scale_max <= 0 or args.aug_scale_min > args.aug_scale_max:
+        raise ValueError("Need 0 < --aug-scale-min <= --aug-scale-max")
+    for name in ["aug_hflip_p", "aug_vflip_p", "aug_intensity_p", "aug_blur_p"]:
+        val = getattr(args, name)
+        if not (0.0 <= val <= 1.0):
+            raise ValueError(f"--{name.replace('_', '-')} must be in [0, 1]")
+    for name in ["aug_rotation_deg", "aug_shift_px", "aug_brightness", "aug_contrast", "aug_noise_std"]:
+        if getattr(args, name) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
 
 
 def main() -> None:
