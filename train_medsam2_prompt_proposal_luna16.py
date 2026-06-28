@@ -1001,10 +1001,18 @@ def extract_sam2_features(sam2: nn.Module, x: torch.Tensor, no_grad: bool = True
 
 
 def build_sam2_image_feature_dict(sam2: nn.Module, x: torch.Tensor) -> Dict[str, List[torch.Tensor] | torch.Tensor]:
-    """Return image_embed and high_res_feats for SAM2 mask decoder.
+    """Return image_embed and high_res_feats for the SAM2 mask decoder.
 
-    This mirrors the logic used by SAM2ImagePredictor, but keeps all prompts/logits in torch.
-    The image encoder is evaluated under no_grad because SAM2 is frozen.
+    Important detail: ``_prepare_backbone_features`` returns several feature maps.
+    The SAM2 mask decoder expects ``image_embeddings`` to have the same spatial
+    size as the dense prompt embeddings from ``sam_prompt_encoder``. For the
+    common 512x512 setup this is the *lowest-resolution* feature, e.g. 32x32,
+    while the high-resolution skip features are typically 64x64 and 128x128.
+
+    The previous version accidentally used the highest-resolution feature as
+    ``image_embed``. That caused errors like:
+        src 128x128 + dense_prompt_embeddings 32x32
+    inside ``sam_mask_decoder.predict_masks``.
     """
     with torch.no_grad():
         backbone_out = sam2.forward_image(x)
@@ -1012,9 +1020,16 @@ def build_sam2_image_feature_dict(sam2: nn.Module, x: torch.Tensor) -> Dict[str,
         if getattr(sam2, "directly_add_no_mem_embed", False):
             vision_feats[-1] = vision_feats[-1] + sam2.no_mem_embed
         feats = [reshape_sam2_feature(f, s, x.shape[0]) for f, s in zip(vision_feats, feat_sizes)]
-        feats = sorted(feats, key=lambda t: int(t.shape[-2]) * int(t.shape[-1]))
-        image_embed = feats[-1]
-        high_res_feats = feats[:-1]
+        feats = sorted(feats, key=lambda t: int(t.shape[-2]) * int(t.shape[-1]))  # low -> high resolution
+
+        # Mask decoder input: lowest-resolution image embedding, usually 32x32.
+        image_embed = feats[0]
+
+        # SAM2 high-res skips are usually expected as [highest_res, mid_res],
+        # e.g. [128x128, 64x64], because the decoder adds them after each
+        # upsampling stage from the 32x32 image embedding.
+        high_res_feats = list(reversed(feats[1:]))
+
     return {"image_embed": image_embed, "high_res_feats": high_res_feats}
 
 
@@ -1585,7 +1600,7 @@ def evaluate_checkpoint(
     pred_dir.mkdir(parents=True, exist_ok=True)
 
     model = build_model(args, device)
-    materialize_lazy_modules(model, sample_image, device, args.amp_dtype, run_sam=args.eval_sam_outputs)
+    materialize_lazy_modules(model, sample_image, device, args.amp_dtype, run_sam=False)
     load_checkpoint(model, ckpt_path, device)
     model.eval()
 
@@ -1786,7 +1801,7 @@ def train(args: argparse.Namespace) -> None:
 
     model = build_model(args, device)
     sample_image = train_ds[0]["image"]
-    materialize_lazy_modules(model, sample_image, device, args.amp_dtype, run_sam=args.sam_guided_loss)
+    materialize_lazy_modules(model, sample_image, device, args.amp_dtype, run_sam=False)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
