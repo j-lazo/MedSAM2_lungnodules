@@ -1585,7 +1585,7 @@ def evaluate_checkpoint(
     pred_dir.mkdir(parents=True, exist_ok=True)
 
     model = build_model(args, device)
-    materialize_lazy_modules(model, sample_image, device, args.amp_dtype, run_sam=args.eval_sam_outputs)
+    materialize_lazy_modules(model, sample_image, device, args.amp_dtype, run_sam=False)
     load_checkpoint(model, ckpt_path, device)
     model.eval()
 
@@ -1786,7 +1786,7 @@ def train(args: argparse.Namespace) -> None:
 
     model = build_model(args, device)
     sample_image = train_ds[0]["image"]
-    materialize_lazy_modules(model, sample_image, device, args.amp_dtype, run_sam=args.sam_guided_loss)
+    materialize_lazy_modules(model, sample_image, device, args.amp_dtype, run_sam=False)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
