@@ -840,6 +840,162 @@ class FPNDecoder(nn.Module):
         return self.out_conv(y)
 
 
+
+def build_2d_sincos_position_embedding(
+    channels: int,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a [1, C, H, W] 2D sine-cosine positional encoding.
+
+    The implementation is intentionally lightweight and computed on the fly so it
+    can be used with arbitrary SAM2/MedSAM2 feature resolutions. If channels is
+    not divisible by four, the embedding is padded or truncated to exactly C.
+    """
+    channels = int(channels)
+    num_freqs = max(1, channels // 4)
+    y = torch.linspace(0.0, 1.0, steps=int(height), device=device, dtype=dtype)
+    x = torch.linspace(0.0, 1.0, steps=int(width), device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    omega = torch.arange(num_freqs, device=device, dtype=dtype)
+    omega = 1.0 / (10000.0 ** (omega / max(num_freqs, 1)))
+    pos_x = xx[..., None] * omega
+    pos_y = yy[..., None] * omega
+    pe = torch.cat([pos_x.sin(), pos_x.cos(), pos_y.sin(), pos_y.cos()], dim=-1)
+    if pe.shape[-1] < channels:
+        pe = F.pad(pe, (0, channels - pe.shape[-1]))
+    elif pe.shape[-1] > channels:
+        pe = pe[..., :channels]
+    return pe.permute(2, 0, 1).unsqueeze(0).contiguous()
+
+
+class MultiLevelTransformerDecoder(nn.Module):
+    """Transformer decoder that fuses multiple MedSAM2/SAM2 feature levels.
+
+    This is the multi-level transformer counterpart of the FPN decoder. It uses
+    the same backbone feature levels as FPN, projects each level to decoder_dim,
+    adds 2D positional encodings plus a learned level embedding, concatenates all
+    spatial locations as transformer tokens, and finally reshapes the transformed
+    tokens back to feature maps for multi-scale fusion and mask prediction.
+
+    To keep memory bounded, the projected feature maps can be downsampled before
+    tokenization when the total number of tokens exceeds max_tokens. The final
+    mask logits are still resized back to the input resolution by the outer model.
+    """
+
+    def __init__(
+        self,
+        decoder_dim: int = 256,
+        num_levels: int = 3,
+        depth: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        refine_blocks: int = 1,
+        max_tokens: int = 1024,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.decoder_dim = int(decoder_dim)
+        self.num_levels = max(1, int(num_levels))
+        self.max_tokens = max(1, int(max_tokens))
+        self.lateral_convs = nn.ModuleList([nn.LazyConv2d(self.decoder_dim, kernel_size=1) for _ in range(self.num_levels)])
+        self.level_embed = nn.Parameter(torch.zeros(self.num_levels, 1, self.decoder_dim))
+
+        depth = max(1, int(depth))
+        ff_dim = int(round(float(mlp_ratio) * self.decoder_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.decoder_dim,
+            nhead=int(num_heads),
+            dim_feedforward=ff_dim,
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(self.decoder_dim)
+
+        refine_blocks = max(0, int(refine_blocks))
+        refine_layers: List[nn.Module] = []
+        for _ in range(refine_blocks):
+            refine_layers.append(ConvGNAct(self.decoder_dim, self.decoder_dim, dropout=dropout))
+        self.refine = nn.Sequential(*refine_layers) if refine_layers else nn.Identity()
+        self.out_conv = nn.Conv2d(self.decoder_dim, 1, kernel_size=1)
+
+    def _select_features(self, features: Sequence[torch.Tensor]) -> List[torch.Tensor]:
+        if not features:
+            raise ValueError("MultiLevelTransformerDecoder received an empty feature list")
+        feats = sorted(list(features), key=lambda t: int(t.shape[-2]) * int(t.shape[-1]))
+        if len(feats) < self.num_levels:
+            raise ValueError(
+                f"Transformer decoder requested {self.num_levels} feature levels, but SAM2 returned only {len(feats)}. "
+                "Lower --fpn-levels/--transformer-levels or use --decoder-type deep/simple."
+            )
+        if len(feats) > self.num_levels:
+            feats = feats[-self.num_levels:]
+        return feats
+
+    def _maybe_downsample_projected_features(self, feats: List[torch.Tensor]) -> List[torch.Tensor]:
+        total_tokens = sum(int(f.shape[-2]) * int(f.shape[-1]) for f in feats)
+        if total_tokens <= self.max_tokens:
+            return feats
+        scale = math.sqrt(float(self.max_tokens) / float(max(total_tokens, 1)))
+        out: List[torch.Tensor] = []
+        for f in feats:
+            h, w = int(f.shape[-2]), int(f.shape[-1])
+            new_h = max(1, int(round(h * scale)))
+            new_w = max(1, int(round(w * scale)))
+            if (new_h, new_w) == (h, w):
+                out.append(f)
+            else:
+                out.append(F.interpolate(f, size=(new_h, new_w), mode="bilinear", align_corners=False))
+        return out
+
+    def forward(self, features: Sequence[torch.Tensor]) -> torch.Tensor:
+        feats = self._select_features(features)
+        projected = [proj(feat) for proj, feat in zip(self.lateral_convs, feats)]
+        projected = self._maybe_downsample_projected_features(projected)
+
+        tokens: List[torch.Tensor] = []
+        spatial_shapes: List[Tuple[int, int]] = []
+        for level, feat in enumerate(projected):
+            b, c, h, w = feat.shape
+            spatial_shapes.append((int(h), int(w)))
+            pos = build_2d_sincos_position_embedding(c, h, w, feat.device, feat.dtype)
+            feat = feat + pos + self.level_embed[level].view(1, c, 1, 1).to(device=feat.device, dtype=feat.dtype)
+            tokens.append(feat.flatten(2).transpose(1, 2))  # [B, H*W, C]
+
+        x = torch.cat(tokens, dim=1)
+        x = self.transformer(x)
+        x = self.norm(x)
+
+        # Split transformer tokens back into feature maps and fuse all levels at
+        # the highest transformed spatial resolution.
+        maps: List[torch.Tensor] = []
+        start = 0
+        for h, w in spatial_shapes:
+            n = int(h) * int(w)
+            part = x[:, start:start + n, :]
+            start += n
+            maps.append(part.transpose(1, 2).reshape(x.shape[0], self.decoder_dim, h, w).contiguous())
+
+        target_hw = max((m.shape[-2:] for m in maps), key=lambda s: int(s[0]) * int(s[1]))
+        fused = torch.zeros(
+            (maps[0].shape[0], self.decoder_dim, int(target_hw[0]), int(target_hw[1])),
+            device=maps[0].device,
+            dtype=maps[0].dtype,
+        )
+        for m in maps:
+            if m.shape[-2:] != target_hw:
+                m = F.interpolate(m, size=target_hw, mode="bilinear", align_corners=False)
+            fused = fused + m
+        fused = fused / float(len(maps))
+        fused = self.refine(fused)
+        return self.out_conv(fused)
+
+
 class MedSAM2EncoderSegmentationModel(nn.Module):
     """Promptless segmentation model: MedSAM2/SAM2 image encoder + selectable decoder/head."""
 
@@ -852,6 +1008,10 @@ class MedSAM2EncoderSegmentationModel(nn.Module):
         decoder_depth: int = 4,
         fpn_levels: int = 3,
         decoder_dropout: float = 0.0,
+        transformer_heads: int = 8,
+        transformer_mlp_ratio: float = 4.0,
+        transformer_refine_blocks: int = 1,
+        transformer_max_tokens: int = 1024,
     ):
         super().__init__()
         self.sam2 = sam2_model
@@ -872,8 +1032,19 @@ class MedSAM2EncoderSegmentationModel(nn.Module):
                 smooth_blocks=decoder_depth,
                 dropout=decoder_dropout,
             )
+        elif self.decoder_type == "transformer":
+            self.decoder = MultiLevelTransformerDecoder(
+                decoder_dim=decoder_dim,
+                num_levels=fpn_levels,
+                depth=decoder_depth,
+                num_heads=transformer_heads,
+                mlp_ratio=transformer_mlp_ratio,
+                refine_blocks=transformer_refine_blocks,
+                max_tokens=transformer_max_tokens,
+                dropout=decoder_dropout,
+            )
         else:
-            raise ValueError(f"Unknown decoder_type={decoder_type!r}. Use simple, deep, or fpn.")
+            raise ValueError(f"Unknown decoder_type={decoder_type!r}. Use simple, deep, fpn, or transformer.")
 
     def _forward_backbone(self, x: torch.Tensor):
         if self.freeze_encoder:
@@ -909,7 +1080,7 @@ class MedSAM2EncoderSegmentationModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_hw = x.shape[-2:]
-        if self.decoder_type == "fpn":
+        if self.decoder_type in {"fpn", "transformer"}:
             feats = self.extract_sam2_features(x)
             logits_low = self.decoder(feats)
         else:
@@ -942,6 +1113,10 @@ def build_model(args: argparse.Namespace, device: torch.device) -> MedSAM2Encode
         decoder_depth=args.decoder_depth,
         fpn_levels=args.fpn_levels,
         decoder_dropout=args.decoder_dropout,
+        transformer_heads=args.transformer_heads,
+        transformer_mlp_ratio=args.transformer_mlp_ratio,
+        transformer_refine_blocks=args.transformer_refine_blocks,
+        transformer_max_tokens=args.transformer_max_tokens,
     ).to(device)
     return model
 
@@ -1449,6 +1624,8 @@ def train(args: argparse.Namespace) -> None:
 
     print(f"Training positive-slice segmentation. Output: {out_dir}")
     print(f"Decoder: {args.decoder_type}; decoder_dim={args.decoder_dim}; decoder_depth={args.decoder_depth}; fpn_levels={args.fpn_levels}; dropout={args.decoder_dropout}")
+    if args.decoder_type == "transformer":
+        print(f"Transformer decoder: heads={args.transformer_heads}; mlp_ratio={args.transformer_mlp_ratio}; refine_blocks={args.transformer_refine_blocks}; max_tokens={args.transformer_max_tokens}")
     print(f"Augmentation enabled: {args.augment}")
     print(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
     for epoch in range(1, args.epochs + 1):
@@ -1562,11 +1739,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--model-cfg", required=True)
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--builder", default="sam2.build_sam:build_sam2", help="Model builder import path. Default works for MedSAM2/SAM2 repos exposing build_sam2 via sam2.build_sam.")
-    p.add_argument("--decoder-type", choices=["simple", "deep", "fpn"], default="simple", help="Segmentation decoder/head. simple keeps the original head, deep uses more conv blocks on the final feature, fpn fuses multiple MedSAM2/SAM2 features top-down.")
+    p.add_argument("--decoder-type", choices=["simple", "deep", "fpn", "transformer"], default="simple", help="Segmentation decoder/head. simple keeps the original head, deep uses more conv blocks on the final feature, fpn fuses multiple MedSAM2/SAM2 features top-down, and transformer uses multi-level feature tokens with self-attention.")
     p.add_argument("--decoder-dim", type=int, default=256)
     p.add_argument("--decoder-depth", type=int, default=4, help="For deep: number of ConvGNAct blocks. For fpn: number of smoothing ConvGNAct blocks per FPN level.")
     p.add_argument("--fpn-levels", type=int, default=3, help="Number of MedSAM2/SAM2 backbone feature levels to fuse when --decoder-type fpn.")
-    p.add_argument("--decoder-dropout", type=float, default=0.0, help="Optional Dropout2d probability inside decoder blocks.")
+    p.add_argument("--decoder-dropout", type=float, default=0.0, help="Optional dropout probability inside decoder blocks/transformer layers.")
+    p.add_argument("--transformer-heads", type=int, default=8, help="Number of self-attention heads for --decoder-type transformer.")
+    p.add_argument("--transformer-mlp-ratio", type=float, default=4.0, help="Transformer feed-forward width as a multiple of --decoder-dim.")
+    p.add_argument("--transformer-refine-blocks", type=int, default=1, help="Number of ConvGNAct refinement blocks after multi-level transformer fusion.")
+    p.add_argument("--transformer-max-tokens", type=int, default=1024, help="Maximum total spatial tokens used by the multi-level transformer decoder; feature levels are downsampled if needed.")
     p.add_argument("--unfreeze-encoder", action="store_true", help="Fine-tune the SAM2 image encoder as well as the segmentation head.")
 
     # Image/slice setup
@@ -1640,6 +1821,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--fpn-levels must be >= 1")
     if not (0.0 <= args.decoder_dropout < 1.0):
         raise ValueError("--decoder-dropout must be in [0, 1)")
+    if args.transformer_heads < 1:
+        raise ValueError("--transformer-heads must be >= 1")
+    if args.decoder_dim % args.transformer_heads != 0:
+        raise ValueError("--decoder-dim must be divisible by --transformer-heads for --decoder-type transformer")
+    if args.transformer_mlp_ratio <= 0:
+        raise ValueError("--transformer-mlp-ratio must be > 0")
+    if args.transformer_refine_blocks < 0:
+        raise ValueError("--transformer-refine-blocks must be >= 0")
+    if args.transformer_max_tokens < 1:
+        raise ValueError("--transformer-max-tokens must be >= 1")
     if args.aug_scale_min <= 0 or args.aug_scale_max <= 0 or args.aug_scale_min > args.aug_scale_max:
         raise ValueError("Need 0 < --aug-scale-min <= --aug-scale-max")
     for name in ["aug_hflip_p", "aug_vflip_p", "aug_intensity_p", "aug_blur_p"]:
