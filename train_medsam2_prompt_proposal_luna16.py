@@ -25,7 +25,7 @@ Important implementation note:
   in torch.no_grad(), so gradients can flow from the SAM mask loss to the proposal heads. The SAM2
   weights remain frozen because requires_grad=False. Because SAM2/MedSAM2 forks differ internally,
   use --no-sam-guided-loss for debugging if your fork needs a small adapter change in the direct
-  SAM forward path.
+  SAM forward path. Prompt coordinates are passed without any extra half-pixel offset.
 
 Expected LUNA-style layout:
   DATASET_DIR/CT_volumes/*.mhd
@@ -1201,36 +1201,40 @@ class FrozenSAM2Guidance(nn.Module):
     """Frozen SAM2 forward path used only for SAM-guided proposal losses.
 
     Gradients are allowed through prompt coordinates into the proposal network. SAM2 weights remain frozen.
+
+    Prompt handling intentionally mirrors the SAM2 image-predictor API:
+      - point prompts are passed through ``points=(coords, labels)``
+      - box prompts are passed through ``boxes=box_xyxy``
+      - point+box prompts pass both arguments at the same time
+
+    No half-pixel offset is added here. Coordinates are expected to be in the
+    same pixel-coordinate convention as the predictor input prompts.
     """
 
-    def __init__(self, sam2_model: nn.Module, add_half_pixel_to_prompts: bool = True):
+    def __init__(self, sam2_model: nn.Module):
         super().__init__()
         self.sam2 = sam2_model
-        self.add_half_pixel_to_prompts = bool(add_half_pixel_to_prompts)
         freeze_module(self.sam2)
 
     def _make_points(self, point_xy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # point_xy: [B, 1, 2] or [B, 2]
+        # point_xy: [B, 1, 2] or [B, 2], xy pixel coordinates.
         if point_xy.ndim == 2:
             point_xy = point_xy[:, None, :]
+        if point_xy.ndim != 3 or point_xy.shape[-1] != 2:
+            raise ValueError(f"Expected point_xy with shape [B, N, 2] or [B, 2], got {tuple(point_xy.shape)}")
         coords = point_xy
-        if self.add_half_pixel_to_prompts:
-            coords = coords + 0.5
         labels = torch.ones(coords.shape[:2], dtype=torch.int64, device=coords.device)
         return coords, labels
 
-    def _make_box_points(self, box_xyxy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # SAM2 prompt encoder commonly represents boxes as two corner points with labels 2 and 3.
-        if box_xyxy.ndim == 2:
-            box_xyxy = box_xyxy[:, None, :]
-        if box_xyxy.shape[1] != 1:
-            raise NotImplementedError("FrozenSAM2Guidance currently supports one box per image.")
-        box = box_xyxy[:, 0, :]
-        corners = box.reshape(box.shape[0], 2, 2)
-        if self.add_half_pixel_to_prompts:
-            corners = corners + 0.5
-        labels = torch.tensor([2, 3], dtype=torch.int64, device=box.device).view(1, 2).expand(box.shape[0], 2)
-        return corners, labels
+    def _make_boxes(self, box_xyxy: torch.Tensor) -> torch.Tensor:
+        # box_xyxy: [B, 4] or [B, 1, 4], xyxy pixel coordinates.
+        if box_xyxy.ndim == 3:
+            if box_xyxy.shape[1] != 1:
+                raise NotImplementedError("FrozenSAM2Guidance currently supports one box per image.")
+            box_xyxy = box_xyxy[:, 0, :]
+        if box_xyxy.ndim != 2 or box_xyxy.shape[-1] != 4:
+            raise ValueError(f"Expected box_xyxy with shape [B, 4] or [B, 1, 4], got {tuple(box_xyxy.shape)}")
+        return box_xyxy
 
     def decode(self, image: torch.Tensor, *, point_xy: Optional[torch.Tensor] = None, box_xyxy: Optional[torch.Tensor] = None) -> torch.Tensor:
         if point_xy is None and box_xyxy is None:
@@ -1238,20 +1242,13 @@ class FrozenSAM2Guidance(nn.Module):
         input_hw = image.shape[-2:]
         feats = build_sam2_image_feature_dict(self.sam2, image)
 
-        if point_xy is not None and box_xyxy is not None:
-            p_coords, p_labels = self._make_points(point_xy)
-            b_coords, b_labels = self._make_box_points(box_xyxy)
-            coords = torch.cat([p_coords, b_coords], dim=1)
-            labels = torch.cat([p_labels, b_labels], dim=1)
-        elif point_xy is not None:
-            coords, labels = self._make_points(point_xy)
-        else:
-            coords, labels = self._make_box_points(box_xyxy)
+        points = self._make_points(point_xy) if point_xy is not None else None
+        boxes = self._make_boxes(box_xyxy) if box_xyxy is not None else None
 
         sparse_embeddings, dense_embeddings = _call_prompt_encoder(
             self.sam2.sam_prompt_encoder,
-            points=(coords, labels),
-            boxes=None,
+            points=points,
+            boxes=boxes,
             masks=None,
         )
         image_pe = self.sam2.sam_prompt_encoder.get_dense_pe()
@@ -1290,7 +1287,6 @@ class PromptProposalModel(nn.Module):
         unet_base_ch: int = 32,
         unet_out_ch: int = 128,
         num_prompts: int = 1,
-        add_half_pixel_to_prompts: bool = True,
         prompt_source: str = "heads",
         coarse_prompt_threshold: float = 0.5,
         coarse_prompt_box_std_scale: float = 2.0,
@@ -1307,7 +1303,7 @@ class PromptProposalModel(nn.Module):
         self.coarse_prompt_min_box_size_px = int(coarse_prompt_min_box_size_px)
         self.coarse_prompt_box_pad_px = int(coarse_prompt_box_pad_px)
         freeze_module(self.sam2)
-        self.sam_guidance = FrozenSAM2Guidance(self.sam2, add_half_pixel_to_prompts=add_half_pixel_to_prompts)
+        self.sam_guidance = FrozenSAM2Guidance(self.sam2)
 
         if self.proposal_backbone == "medsam2-fpn":
             if self.decoder_type == "fpn":
@@ -1865,7 +1861,6 @@ def build_model(args: argparse.Namespace, device: torch.device) -> PromptProposa
         unet_base_ch=args.unet_base_ch,
         unet_out_ch=args.unet_out_ch,
         num_prompts=args.num_prompts,
-        add_half_pixel_to_prompts=args.add_half_pixel_to_prompts,
         prompt_source=args.prompt_source,
         coarse_prompt_threshold=args.coarse_prompt_threshold,
         coarse_prompt_box_std_scale=args.coarse_prompt_box_std_scale,
@@ -2229,7 +2224,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--unet-base-ch", type=int, default=32)
     p.add_argument("--unet-out-ch", type=int, default=128)
     p.add_argument("--num-prompts", type=int, default=1, help="Currently only 1 is implemented; output tensors keep a prompt dimension for future extension.")
-    p.add_argument("--add-half-pixel-to-prompts", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
         "--prompt-source",
         choices=["heads", "coarse-soft", "coarse-hard"],
