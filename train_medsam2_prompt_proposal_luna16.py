@@ -135,6 +135,8 @@ def make_output_dir(args: argparse.Namespace) -> Path:
                 "medsam2_prompt_proposal",
                 args.proposal_backbone,
                 args.decoder_type,
+                getattr(args, "prompt_source", "heads"),
+                "curr" if getattr(args, "curriculum_training", False) else "nocurr",
                 aug,
                 triplet,
                 size,
@@ -957,6 +959,139 @@ class ProposalHeads(nn.Module):
         }
 
 
+# -----------------------------------------------------------------------------
+# Prompt extraction from predicted coarse masks
+# -----------------------------------------------------------------------------
+
+
+def soft_prompts_from_coarse_logits(
+    coarse_logits: torch.Tensor,
+    box_std_scale: float = 2.0,
+    min_box_size_px: float = 3.0,
+    box_pad_px: float = 0.0,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Differentiably derive one point and one xyxy box from coarse mask logits.
+
+    The point is the probability-weighted center of mass. The box is a moment-based
+    soft box around that center: center +/- box_std_scale * weighted std, with an
+    optional pad. This keeps gradients from SAM losses connected to the coarse
+    mask logits, unlike threshold + connected-components extraction.
+    """
+    if coarse_logits.ndim != 4 or coarse_logits.shape[1] != 1:
+        raise ValueError(f"Expected coarse_logits [B,1,H,W], got {tuple(coarse_logits.shape)}")
+    # Work in float32 even under fp16 autocast; coordinate variances can exceed fp16 range for 512x512 images.
+    work_logits = coarse_logits.float()
+    B, _, H, W = work_logits.shape
+    dtype = work_logits.dtype
+    device = work_logits.device
+    probs = torch.sigmoid(work_logits).clamp_min(eps)
+
+    ys = torch.arange(H, dtype=dtype, device=device).view(1, 1, H, 1)
+    xs = torch.arange(W, dtype=dtype, device=device).view(1, 1, 1, W)
+    mass = probs.sum(dim=(2, 3), keepdim=True).clamp_min(eps)
+
+    cx = (probs * xs).sum(dim=(2, 3), keepdim=True) / mass
+    cy = (probs * ys).sum(dim=(2, 3), keepdim=True) / mass
+
+    var_x = (probs * (xs - cx).pow(2)).sum(dim=(2, 3), keepdim=True) / mass
+    var_y = (probs * (ys - cy).pow(2)).sum(dim=(2, 3), keepdim=True) / mass
+    std_x = torch.sqrt(var_x + eps)
+    std_y = torch.sqrt(var_y + eps)
+
+    min_half = 0.5 * float(max(min_box_size_px, 1.0))
+    half_w = torch.clamp(float(box_std_scale) * std_x + float(box_pad_px), min=min_half)
+    half_h = torch.clamp(float(box_std_scale) * std_y + float(box_pad_px), min=min_half)
+
+    point_xy = torch.cat([cx, cy], dim=-1).view(B, 1, 2)
+    x1 = (cx - half_w).view(B, 1)
+    y1 = (cy - half_h).view(B, 1)
+    x2 = (cx + half_w).view(B, 1)
+    y2 = (cy + half_h).view(B, 1)
+    box_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
+    box_xyxy = clip_boxes_torch(box_xyxy, H=H, W=W)
+    return point_xy, box_xyxy
+
+
+def _largest_component_prompt_from_prob_np(
+    prob_2d: np.ndarray,
+    threshold: float,
+    min_box_size_px: int,
+    box_pad_px: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Hard, non-differentiable prompt extraction from one probability map."""
+    prob = np.asarray(prob_2d, dtype=np.float32)
+    H, W = prob.shape
+    mask = (prob >= float(threshold)).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num > 1:
+        # Ignore background row 0 and keep the largest predicted component.
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        mask = (labels == largest).astype(np.uint8)
+    if mask.sum() == 0:
+        y, x = np.unravel_index(int(np.argmax(prob)), prob.shape)
+        half = max(1, int(min_box_size_px)) / 2.0
+        point = np.array([float(x), float(y)], dtype=np.float32)
+        box = np.array([x - half, y - half, x + half, y + half], dtype=np.float32)
+    else:
+        point, box, _ = mask_to_box_and_point(mask)
+
+    if box_pad_px != 0:
+        box = box.astype(np.float32).copy()
+        box[0] -= float(box_pad_px)
+        box[1] -= float(box_pad_px)
+        box[2] += float(box_pad_px)
+        box[3] += float(box_pad_px)
+
+    # Enforce a minimum size while preserving center when possible.
+    cx = 0.5 * (float(box[0]) + float(box[2]))
+    cy = 0.5 * (float(box[1]) + float(box[3]))
+    min_size = max(1.0, float(min_box_size_px))
+    if float(box[2] - box[0] + 1.0) < min_size:
+        half = 0.5 * (min_size - 1.0)
+        box[0], box[2] = cx - half, cx + half
+    if float(box[3] - box[1] + 1.0) < min_size:
+        half = 0.5 * (min_size - 1.0)
+        box[1], box[3] = cy - half, cy + half
+
+    box[0] = np.clip(box[0], 0, W - 1)
+    box[2] = np.clip(box[2], 0, W - 1)
+    box[1] = np.clip(box[1], 0, H - 1)
+    box[3] = np.clip(box[3], 0, H - 1)
+    x1, x2 = min(box[0], box[2]), max(box[0], box[2])
+    y1, y2 = min(box[1], box[3]), max(box[1], box[3])
+    return point.astype(np.float32), np.array([x1, y1, x2, y2], dtype=np.float32)
+
+
+def hard_prompts_from_coarse_logits(
+    coarse_logits: torch.Tensor,
+    threshold: float = 0.5,
+    min_box_size_px: int = 3,
+    box_pad_px: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Hard prompt extraction from predicted coarse masks.
+
+    This exactly follows the usual threshold/component/bbox logic but is not
+    differentiable. It is useful as an ablation and for inference, but SAM-guided
+    losses will not backpropagate through this extraction step.
+    """
+    probs = torch.sigmoid(coarse_logits).detach().float().cpu().numpy()[:, 0]
+    points: List[np.ndarray] = []
+    boxes: List[np.ndarray] = []
+    for prob in probs:
+        p, b = _largest_component_prompt_from_prob_np(
+            prob,
+            threshold=threshold,
+            min_box_size_px=min_box_size_px,
+            box_pad_px=box_pad_px,
+        )
+        points.append(p)
+        boxes.append(b)
+    point_xy = torch.as_tensor(np.stack(points, axis=0), dtype=coarse_logits.dtype, device=coarse_logits.device)[:, None, :]
+    box_xyxy = torch.as_tensor(np.stack(boxes, axis=0), dtype=coarse_logits.dtype, device=coarse_logits.device)[:, None, :]
+    return point_xy, box_xyxy
+
+
 # =============================================================================
 # SAM2 direct frozen guidance
 # =============================================================================
@@ -1156,11 +1291,21 @@ class PromptProposalModel(nn.Module):
         unet_out_ch: int = 128,
         num_prompts: int = 1,
         add_half_pixel_to_prompts: bool = True,
+        prompt_source: str = "heads",
+        coarse_prompt_threshold: float = 0.5,
+        coarse_prompt_box_std_scale: float = 2.0,
+        coarse_prompt_min_box_size_px: int = 3,
+        coarse_prompt_box_pad_px: int = 0,
     ):
         super().__init__()
         self.sam2 = sam2_model
         self.proposal_backbone = str(proposal_backbone)
         self.decoder_type = str(decoder_type)
+        self.prompt_source = str(prompt_source)
+        self.coarse_prompt_threshold = float(coarse_prompt_threshold)
+        self.coarse_prompt_box_std_scale = float(coarse_prompt_box_std_scale)
+        self.coarse_prompt_min_box_size_px = int(coarse_prompt_min_box_size_px)
+        self.coarse_prompt_box_pad_px = int(coarse_prompt_box_pad_px)
         freeze_module(self.sam2)
         self.sam_guidance = FrozenSAM2Guidance(self.sam2, add_half_pixel_to_prompts=add_half_pixel_to_prompts)
 
@@ -1211,6 +1356,32 @@ class PromptProposalModel(nn.Module):
     def forward(self, x: torch.Tensor, run_sam: bool = True) -> Dict[str, torch.Tensor]:
         feat = self.extract_proposal_features(x)
         out = self.heads(feat, input_hw=x.shape[-2:])
+
+        # Keep raw head outputs for diagnostics even when the prompts actually sent
+        # to MedSAM2 are derived from the predicted coarse mask.
+        out["point_xy_head"] = out["point_xy"]
+        out["box_xyxy_head"] = out["box_xyxy"]
+        if self.prompt_source == "coarse-soft":
+            point_xy, box_xyxy = soft_prompts_from_coarse_logits(
+                out["coarse_logits"],
+                box_std_scale=self.coarse_prompt_box_std_scale,
+                min_box_size_px=self.coarse_prompt_min_box_size_px,
+                box_pad_px=self.coarse_prompt_box_pad_px,
+            )
+            out["point_xy"] = point_xy
+            out["box_xyxy"] = box_xyxy
+        elif self.prompt_source == "coarse-hard":
+            point_xy, box_xyxy = hard_prompts_from_coarse_logits(
+                out["coarse_logits"],
+                threshold=self.coarse_prompt_threshold,
+                min_box_size_px=self.coarse_prompt_min_box_size_px,
+                box_pad_px=self.coarse_prompt_box_pad_px,
+            )
+            out["point_xy"] = point_xy
+            out["box_xyxy"] = box_xyxy
+        elif self.prompt_source != "heads":
+            raise ValueError(f"Unknown prompt_source={self.prompt_source!r}")
+
         if run_sam:
             sam_point_logits, sam_box_logits = self.sam_guidance(
                 x,
@@ -1310,12 +1481,13 @@ def compute_losses(outputs: Dict[str, torch.Tensor], batch: Dict, args: argparse
     box_l1 = normalized_smooth_l1(outputs["box_xyxy"], gt_box, valid, input_hw)
     box_giou = generalized_iou_loss(outputs["box_xyxy"], gt_box, valid=valid)
 
-    total = (
-        args.lambda_coarse * coarse
-        + args.lambda_point * point
-        + args.lambda_box_l1 * box_l1
-        + args.lambda_box_giou * box_giou
+    supervise_prompts = (
+        args.prompt_source == "heads"
+        or (args.prompt_source == "coarse-soft" and args.supervise_derived_prompts)
     )
+    total = args.lambda_coarse * coarse
+    if supervise_prompts:
+        total = total + args.lambda_point * point + args.lambda_box_l1 * box_l1 + args.lambda_box_giou * box_giou
     logs: Dict[str, float] = {
         "loss_coarse": float(coarse.detach()),
         "coarse_bce": coarse_logs["bce"],
@@ -1330,7 +1502,10 @@ def compute_losses(outputs: Dict[str, torch.Tensor], batch: Dict, args: argparse
     if run_sam:
         sam_point, _ = mask_loss(outputs["sam_point_logits"], masks, args.sam_bce_weight, args.sam_dice_weight)
         sam_box, _ = mask_loss(outputs["sam_box_logits"], masks, args.sam_bce_weight, args.sam_dice_weight)
-        total = total + args.lambda_sam_point * sam_point + args.lambda_sam_box * sam_box
+        # Hard threshold/component prompt extraction is non-differentiable, so SAM losses
+        # from coarse-hard prompts are logged but not added to the optimization objective.
+        if args.prompt_source != "coarse-hard":
+            total = total + args.lambda_sam_point * sam_point + args.lambda_sam_box * sam_box
         logs["loss_sam_point"] = float(sam_point.detach())
         logs["loss_sam_box"] = float(sam_box.detach())
 
@@ -1691,6 +1866,11 @@ def build_model(args: argparse.Namespace, device: torch.device) -> PromptProposa
         unet_out_ch=args.unet_out_ch,
         num_prompts=args.num_prompts,
         add_half_pixel_to_prompts=args.add_half_pixel_to_prompts,
+        prompt_source=args.prompt_source,
+        coarse_prompt_threshold=args.coarse_prompt_threshold,
+        coarse_prompt_box_std_scale=args.coarse_prompt_box_std_scale,
+        coarse_prompt_min_box_size_px=args.coarse_prompt_min_box_size_px,
+        coarse_prompt_box_pad_px=args.coarse_prompt_box_pad_px,
     ).to(device)
     return model
 
@@ -1708,6 +1888,77 @@ def materialize_lazy_modules(model: nn.Module, sample_image: torch.Tensor, devic
 # =============================================================================
 # Main training routine
 # =============================================================================
+
+
+def copy_args_with_overrides(args: argparse.Namespace, **overrides) -> argparse.Namespace:
+    d = vars(args).copy()
+    d.update(overrides)
+    return argparse.Namespace(**d)
+
+
+def curriculum_state(args: argparse.Namespace, epoch: int) -> Dict[str, object]:
+    """Return the effective stage and SAM-loss weights for one epoch.
+
+    Stages when --curriculum-training is enabled:
+      0) proposal_warmup: no SAM-guided losses
+      1) sam_ramp: SAM-guided losses enabled with a linear lambda factor
+      2) sam_full: full requested SAM-guided lambda values
+
+    If --no-sam-guided-loss is set, SAM stays disabled in all stages.
+    """
+    if not getattr(args, "curriculum_training", False):
+        run_sam = bool(args.sam_guided_loss)
+        return {
+            "stage_index": 0,
+            "stage_name": "single",
+            "sam_factor": 1.0 if run_sam else 0.0,
+            "sam_guided_loss": run_sam,
+            "lambda_sam_point": float(args.lambda_sam_point) if run_sam else 0.0,
+            "lambda_sam_box": float(args.lambda_sam_box) if run_sam else 0.0,
+        }
+
+    warmup = int(args.curriculum_warmup_epochs)
+    ramp = int(args.curriculum_ramp_epochs)
+    base_run_sam = bool(args.sam_guided_loss)
+
+    if epoch <= warmup:
+        return {
+            "stage_index": 0,
+            "stage_name": "proposal_warmup",
+            "sam_factor": 0.0,
+            "sam_guided_loss": False,
+            "lambda_sam_point": 0.0,
+            "lambda_sam_box": 0.0,
+        }
+
+    if ramp > 0 and epoch <= warmup + ramp:
+        if ramp == 1:
+            progress = 1.0
+        else:
+            progress = float(epoch - warmup - 1) / float(max(ramp - 1, 1))
+        start = float(args.curriculum_ramp_start_factor)
+        end = float(args.curriculum_ramp_end_factor)
+        factor = start + (end - start) * progress
+        factor = float(np.clip(factor, 0.0, max(start, end, 1.0)))
+        run_sam = base_run_sam and factor > 0
+        return {
+            "stage_index": 1,
+            "stage_name": "sam_ramp",
+            "sam_factor": factor if run_sam else 0.0,
+            "sam_guided_loss": run_sam,
+            "lambda_sam_point": float(args.lambda_sam_point) * factor if run_sam else 0.0,
+            "lambda_sam_box": float(args.lambda_sam_box) * factor if run_sam else 0.0,
+        }
+
+    run_sam = base_run_sam
+    return {
+        "stage_index": 2 if warmup > 0 or ramp > 0 else 0,
+        "stage_name": "sam_full" if run_sam else "proposal_only",
+        "sam_factor": 1.0 if run_sam else 0.0,
+        "sam_guided_loss": run_sam,
+        "lambda_sam_point": float(args.lambda_sam_point) if run_sam else 0.0,
+        "lambda_sam_box": float(args.lambda_sam_box) if run_sam else 0.0,
+    }
 
 
 def save_config(args: argparse.Namespace, out_dir: Path, index: DatasetIndex, positive_ids: Sequence[str], splits: Dict[str, List[str]]) -> None:
@@ -1813,10 +2064,39 @@ def train(args: argparse.Namespace) -> None:
     metrics_rows: List[Dict] = []
 
     print(f"Training prompt-proposal model. Output: {out_dir}")
-    print(f"Proposal backbone: {args.proposal_backbone}; decoder={args.decoder_type}; sam_guided_loss={args.sam_guided_loss}")
+    print(
+        f"Proposal backbone: {args.proposal_backbone}; decoder={args.decoder_type}; "
+        f"prompt_source={args.prompt_source}; sam_guided_loss={args.sam_guided_loss}; "
+        f"curriculum={args.curriculum_training}"
+    )
     print(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
 
+    current_stage_index: Optional[int] = None
+    stage_best_initialized = False
+    current_stage_name = ""
+
     for epoch in range(1, args.epochs + 1):
+        stage = curriculum_state(args, epoch)
+        stage_index = int(stage["stage_index"])
+        if current_stage_index != stage_index:
+            current_stage_index = stage_index
+            current_stage_name = str(stage["stage_name"])
+            bad_epochs = 0
+            best_val = float("inf")
+            stage_best_initialized = False
+            print(
+                f"\n=== Starting curriculum stage {stage_index}: {current_stage_name} "
+                f"at epoch {epoch} | sam_factor={float(stage['sam_factor']):.3f} | "
+                f"run_sam={bool(stage['sam_guided_loss'])} ==="
+            )
+
+        epoch_args = copy_args_with_overrides(
+            args,
+            sam_guided_loss=bool(stage["sam_guided_loss"]),
+            lambda_sam_point=float(stage["lambda_sam_point"]),
+            lambda_sam_box=float(stage["lambda_sam_box"]),
+        )
+
         train_log = run_epoch(
             model,
             train_loader,
@@ -1825,8 +2105,8 @@ def train(args: argparse.Namespace) -> None:
             device,
             args.amp_dtype,
             args.threshold,
-            desc=f"train {epoch}/{args.epochs}",
-            args=args,
+            desc=f"train {epoch}/{args.epochs} [{current_stage_name}]",
+            args=epoch_args,
         )
         val_log = run_epoch(
             model,
@@ -1836,13 +2116,18 @@ def train(args: argparse.Namespace) -> None:
             device,
             args.amp_dtype,
             args.threshold,
-            desc=f"val {epoch}/{args.epochs}",
-            args=args,
+            desc=f"val {epoch}/{args.epochs} [{current_stage_name}]",
+            args=epoch_args,
         )
         scheduler.step()
 
         row = {
             "epoch": epoch,
+            "curriculum_stage_index": stage_index,
+            "curriculum_stage": current_stage_name,
+            "sam_factor": float(stage["sam_factor"]),
+            "effective_lambda_sam_point": float(stage["lambda_sam_point"]),
+            "effective_lambda_sam_box": float(stage["lambda_sam_box"]),
             **{f"train_{k}": v for k, v in train_log.items()},
             **{f"val_{k}": v for k, v in val_log.items()},
             "lr": optimizer.param_groups[0]["lr"],
@@ -1862,15 +2147,24 @@ def train(args: argparse.Namespace) -> None:
         )
 
         save_checkpoint(out_dir / "last_model.pt", model, optimizer, epoch, best_val, args)
-        if val_log["loss"] < best_val - args.min_delta:
-            best_val = val_log["loss"]
+        val_metric = float(val_log["loss"])
+        if not stage_best_initialized:
+            best_val = val_metric
+            bad_epochs = 0
+            stage_best_initialized = True
+            save_checkpoint(out_dir / "best_model.pt", model, optimizer, epoch, best_val, args)
+            save_checkpoint(out_dir / f"best_model_stage{stage_index}_{current_stage_name}.pt", model, optimizer, epoch, best_val, args)
+            print(f"  reset stage best at val_loss={best_val:.5f} and saved best_model.pt")
+        elif val_metric < best_val - args.min_delta:
+            best_val = val_metric
             bad_epochs = 0
             save_checkpoint(out_dir / "best_model.pt", model, optimizer, epoch, best_val, args)
-            print(f"  saved best_model.pt with val_loss={best_val:.5f}")
+            save_checkpoint(out_dir / f"best_model_stage{stage_index}_{current_stage_name}.pt", model, optimizer, epoch, best_val, args)
+            print(f"  saved best_model.pt with stage val_loss={best_val:.5f}")
         else:
             bad_epochs += 1
             if args.patience > 0 and bad_epochs >= args.patience:
-                print(f"Early stopping after {bad_epochs} bad epochs.")
+                print(f"Early stopping in stage {stage_index} ({current_stage_name}) after {bad_epochs} bad epochs.")
                 break
 
     plot_training_metrics(out_dir / "metrics.csv", out_dir)
@@ -1936,6 +2230,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--unet-out-ch", type=int, default=128)
     p.add_argument("--num-prompts", type=int, default=1, help="Currently only 1 is implemented; output tensors keep a prompt dimension for future extension.")
     p.add_argument("--add-half-pixel-to-prompts", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--prompt-source",
+        choices=["heads", "coarse-soft", "coarse-hard"],
+        default="heads",
+        help=(
+            "Which prompts are sent to frozen MedSAM2. 'heads' uses the learned point/box heads. "
+            "'coarse-soft' derives differentiable moment-based point/box prompts from the coarse mask. "
+            "'coarse-hard' thresholds the coarse mask and extracts the largest component/bbox; this is not differentiable."
+        ),
+    )
+    p.add_argument("--supervise-derived-prompts", action=argparse.BooleanOptionalAction, default=True,
+                   help="When --prompt-source coarse-soft, also apply point/box losses to the derived prompts.")
+    p.add_argument("--coarse-prompt-threshold", type=float, default=0.5, help="Threshold used by --prompt-source coarse-hard.")
+    p.add_argument("--coarse-prompt-box-std-scale", type=float, default=2.0, help="Box half-size multiplier for --prompt-source coarse-soft.")
+    p.add_argument("--coarse-prompt-min-box-size-px", type=int, default=3, help="Minimum derived prompt-box side length.")
+    p.add_argument("--coarse-prompt-box-pad-px", type=int, default=0, help="Extra padding in pixels around coarse-derived prompt boxes.")
 
     # Image/slice setup
     p.add_argument("--use-triplet-channels", action=argparse.BooleanOptionalAction, default=True)
@@ -1956,6 +2266,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lambda-sam-point", type=float, default=1.0)
     p.add_argument("--lambda-sam-box", type=float, default=1.0)
     p.add_argument("--sam-guided-loss", action=argparse.BooleanOptionalAction, default=True, help="Use frozen MedSAM2 point/box output losses during training.")
+
+    # Curriculum / staged training
+    p.add_argument("--curriculum-training", action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable staged training: proposal-only warmup, SAM-loss ramp, then full SAM-guided training.")
+    p.add_argument("--curriculum-warmup-epochs", type=int, default=30,
+                   help="Proposal-only warmup epochs when --curriculum-training is enabled.")
+    p.add_argument("--curriculum-ramp-epochs", type=int, default=30,
+                   help="Epochs over which SAM loss lambdas are linearly ramped when --curriculum-training is enabled.")
+    p.add_argument("--curriculum-ramp-start-factor", type=float, default=0.25,
+                   help="Initial multiplier for lambda-sam-point/box in the SAM ramp stage.")
+    p.add_argument("--curriculum-ramp-end-factor", type=float, default=1.0,
+                   help="Final multiplier for lambda-sam-point/box in the SAM ramp stage.")
 
     # Training
     p.add_argument("--epochs", type=int, default=30)
@@ -2020,6 +2342,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--decoder-dropout must be in [0, 1)")
     if args.num_prompts != 1:
         raise ValueError("This first implementation supports --num-prompts 1 only")
+    if args.prompt_source == "coarse-hard" and args.supervise_derived_prompts:
+        print("NOTE: --supervise-derived-prompts has no effect with --prompt-source coarse-hard because hard extraction is non-differentiable.")
+    if args.coarse_prompt_min_box_size_px < 1:
+        raise ValueError("--coarse-prompt-min-box-size-px must be >= 1")
+    if args.coarse_prompt_box_pad_px < 0:
+        raise ValueError("--coarse-prompt-box-pad-px must be >= 0")
+    if args.coarse_prompt_box_std_scale <= 0:
+        raise ValueError("--coarse-prompt-box-std-scale must be > 0")
+    if not (0.0 <= args.coarse_prompt_threshold <= 1.0):
+        raise ValueError("--coarse-prompt-threshold must be in [0, 1]")
+    if args.curriculum_warmup_epochs < 0 or args.curriculum_ramp_epochs < 0:
+        raise ValueError("Curriculum epoch counts must be >= 0")
+    if args.curriculum_ramp_start_factor < 0 or args.curriculum_ramp_end_factor < 0:
+        raise ValueError("Curriculum SAM lambda factors must be >= 0")
     for name in [
         "coarse_bce_weight",
         "coarse_dice_weight",
