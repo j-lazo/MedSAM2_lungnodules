@@ -136,6 +136,7 @@ def make_output_dir(args: argparse.Namespace) -> Path:
                 args.proposal_backbone,
                 args.decoder_type,
                 getattr(args, "prompt_source", "heads"),
+                getattr(args, "finetune_mode", "all"),
                 "curr" if getattr(args, "curriculum_training", False) else "nocurr",
                 aug,
                 triplet,
@@ -932,7 +933,7 @@ class ProposalHeads(nn.Module):
         H, W = int(input_hw[0]), int(input_hw[1])
         feat_full = F.interpolate(feat, size=input_hw, mode="bilinear", align_corners=False) if feat.shape[-2:] != input_hw else feat
         feat_full = self.refine(feat_full)
-        coarse_logits = self.coarse_head(feat_full)
+        coarse_logits = feat_full #self.coarse_head(feat_full)
 
         pooled = self.pool(feat_full)
         point_raw = self.point_mlp(pooled).view(-1, self.num_prompts, 2)
@@ -1292,6 +1293,7 @@ class PromptProposalModel(nn.Module):
         coarse_prompt_box_std_scale: float = 2.0,
         coarse_prompt_min_box_size_px: int = 3,
         coarse_prompt_box_pad_px: int = 0,
+        sam_guided_modes: Sequence[str] = ("point", "box"),
     ):
         super().__init__()
         self.sam2 = sam2_model
@@ -1302,6 +1304,10 @@ class PromptProposalModel(nn.Module):
         self.coarse_prompt_box_std_scale = float(coarse_prompt_box_std_scale)
         self.coarse_prompt_min_box_size_px = int(coarse_prompt_min_box_size_px)
         self.coarse_prompt_box_pad_px = int(coarse_prompt_box_pad_px)
+        self.sam_guided_modes = tuple(str(m) for m in sam_guided_modes)
+        bad_modes = sorted(set(self.sam_guided_modes) - {"point", "box", "point+box"})
+        if bad_modes:
+            raise ValueError(f"Unknown SAM-guided mode(s): {bad_modes}")
         freeze_module(self.sam2)
         self.sam_guidance = FrozenSAM2Guidance(self.sam2)
 
@@ -1379,13 +1385,19 @@ class PromptProposalModel(nn.Module):
             raise ValueError(f"Unknown prompt_source={self.prompt_source!r}")
 
         if run_sam:
-            sam_point_logits, sam_box_logits = self.sam_guidance(
-                x,
-                point_xy=out["point_xy"],
-                box_xyxy=out["box_xyxy"],
-            )
-            out["sam_point_logits"] = sam_point_logits
-            out["sam_box_logits"] = sam_box_logits
+            # Compute only the requested frozen-SAM2 guided modes. This keeps the
+            # training cost controllable and allows optimizing the exact inference
+            # prompt mode of interest (point, box, or point+box).
+            if "point" in self.sam_guided_modes:
+                out["sam_point_logits"] = self.sam_guidance.decode(x, point_xy=out["point_xy"])
+            if "box" in self.sam_guided_modes:
+                out["sam_box_logits"] = self.sam_guidance.decode(x, box_xyxy=out["box_xyxy"])
+            if "point+box" in self.sam_guided_modes:
+                out["sam_point_box_logits"] = self.sam_guidance.decode(
+                    x,
+                    point_xy=out["point_xy"],
+                    box_xyxy=out["box_xyxy"],
+                )
         return out
 
 
@@ -1493,17 +1505,28 @@ def compute_losses(outputs: Dict[str, torch.Tensor], batch: Dict, args: argparse
         "loss_box_giou": float(box_giou.detach()),
         "loss_sam_point": 0.0,
         "loss_sam_box": 0.0,
+        "loss_sam_point_box": 0.0,
     }
 
     if run_sam:
-        sam_point, _ = mask_loss(outputs["sam_point_logits"], masks, args.sam_bce_weight, args.sam_dice_weight)
-        sam_box, _ = mask_loss(outputs["sam_box_logits"], masks, args.sam_bce_weight, args.sam_dice_weight)
         # Hard threshold/component prompt extraction is non-differentiable, so SAM losses
         # from coarse-hard prompts are logged but not added to the optimization objective.
-        if args.prompt_source != "coarse-hard":
-            total = total + args.lambda_sam_point * sam_point + args.lambda_sam_box * sam_box
-        logs["loss_sam_point"] = float(sam_point.detach())
-        logs["loss_sam_box"] = float(sam_box.detach())
+        add_sam_losses = args.prompt_source != "coarse-hard"
+        if "sam_point_logits" in outputs:
+            sam_point, _ = mask_loss(outputs["sam_point_logits"], masks, args.sam_bce_weight, args.sam_dice_weight)
+            if add_sam_losses:
+                total = total + args.lambda_sam_point * sam_point
+            logs["loss_sam_point"] = float(sam_point.detach())
+        if "sam_box_logits" in outputs:
+            sam_box, _ = mask_loss(outputs["sam_box_logits"], masks, args.sam_bce_weight, args.sam_dice_weight)
+            if add_sam_losses:
+                total = total + args.lambda_sam_box * sam_box
+            logs["loss_sam_box"] = float(sam_box.detach())
+        if "sam_point_box_logits" in outputs:
+            sam_point_box, _ = mask_loss(outputs["sam_point_box_logits"], masks, args.sam_bce_weight, args.sam_dice_weight)
+            if add_sam_losses:
+                total = total + args.lambda_sam_point_box * sam_point_box
+            logs["loss_sam_point_box"] = float(sam_point_box.detach())
 
     logs["loss"] = float(total.detach())
     return total, logs
@@ -1546,9 +1569,11 @@ def run_epoch(
         "loss_box_giou": 0.0,
         "loss_sam_point": 0.0,
         "loss_sam_box": 0.0,
+        "loss_sam_point_box": 0.0,
         "DSC_coarse": 0.0,
         "DSC_sam_point": 0.0,
         "DSC_sam_box": 0.0,
+        "DSC_sam_point_box": 0.0,
     }
     n = 0
     run_sam = bool(args.sam_guided_loss)
@@ -1576,24 +1601,30 @@ def run_epoch(
                 scaler.scale(loss).backward()
                 if args.grad_clip_norm > 0:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.grad_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
                 if args.grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.grad_clip_norm)
                 optimizer.step()
 
         with torch.no_grad():
             bs = images.shape[0]
             totals["loss"] += logs["loss"] * bs
-            for k in ["loss_coarse", "loss_point", "loss_box_l1", "loss_box_giou", "loss_sam_point", "loss_sam_box"]:
+            for k in [
+                "loss_coarse", "loss_point", "loss_box_l1", "loss_box_giou",
+                "loss_sam_point", "loss_sam_box", "loss_sam_point_box",
+            ]:
                 totals[k] += logs.get(k, 0.0) * bs
             totals["DSC_coarse"] += batch_dice_from_logits(outputs["coarse_logits"], batch["mask"], threshold) * bs
-            if run_sam:
+            if run_sam and "sam_point_logits" in outputs:
                 totals["DSC_sam_point"] += batch_dice_from_logits(outputs["sam_point_logits"], batch["mask"], threshold) * bs
+            if run_sam and "sam_box_logits" in outputs:
                 totals["DSC_sam_box"] += batch_dice_from_logits(outputs["sam_box_logits"], batch["mask"], threshold) * bs
+            if run_sam and "sam_point_box_logits" in outputs:
+                totals["DSC_sam_point_box"] += batch_dice_from_logits(outputs["sam_point_box_logits"], batch["mask"], threshold) * bs
             n += bs
         pbar.set_postfix({k: f"{totals[k] / max(n, 1):.4f}" for k in ["loss", "DSC_coarse", "DSC_sam_box"]})
 
@@ -1690,7 +1721,8 @@ def predict_case_positive_slices(
     device: torch.device,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], List[Dict]]:
     Z, H, W = case.gt_volume.shape
-    mask_keys = ["coarse", "sam_point", "sam_box"]
+    sam_mode_keys = [f"sam_{str(m).replace('+', '_')}" for m in getattr(args, "sam_guided_modes", ["point", "box"])] if args.eval_sam_outputs else []
+    mask_keys = ["coarse"] + sam_mode_keys
     pred_volumes = {k: np.zeros((Z, H, W), dtype=np.uint8) for k in mask_keys}
     prob_volumes = {k: np.zeros((Z, H, W), dtype=np.float32) for k in mask_keys}
     slice_rows: List[Dict] = []
@@ -1719,8 +1751,9 @@ def predict_case_positive_slices(
 
             logits_map = {"coarse": outputs["coarse_logits"]}
             if args.eval_sam_outputs:
-                logits_map["sam_point"] = outputs["sam_point_logits"]
-                logits_map["sam_box"] = outputs["sam_box_logits"]
+                for key in ["sam_point_logits", "sam_box_logits", "sam_point_box_logits"]:
+                    if key in outputs:
+                        logits_map[key.replace("_logits", "")] = outputs[key]
 
             prompt_points = outputs["point_xy"].detach().float().cpu().numpy()[:, 0]
             prompt_boxes = outputs["box_xyxy"].detach().float().cpu().numpy()[:, 0]
@@ -1795,7 +1828,7 @@ def evaluate_checkpoint(
             }
             for key, pred_vol in pred_volumes.items():
                 # Skip empty sam volumes when eval_sam_outputs is false.
-                if key in {"sam_point", "sam_box"} and not args.eval_sam_outputs:
+                if key.startswith("sam_") and not args.eval_sam_outputs:
                     continue
                 m = segmentation_metrics(case.gt_volume, pred_vol, spacing_zyx)
                 vol_row.update({f"{key}_{mk}": mv for mk, mv in m.items()})
@@ -1803,7 +1836,7 @@ def evaluate_checkpoint(
 
             if args.save_volumes:
                 for key, pred_vol in pred_volumes.items():
-                    if key in {"sam_point", "sam_box"} and not args.eval_sam_outputs:
+                    if key.startswith("sam_") and not args.eval_sam_outputs:
                         continue
                     write_pred_volume(pred_vol, case.image_itk, pred_vol_dir / key / f"{sid}_{key}_{tag}.nii.gz")
                     if args.save_prob_volumes:
@@ -1866,6 +1899,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> PromptProposa
         coarse_prompt_box_std_scale=args.coarse_prompt_box_std_scale,
         coarse_prompt_min_box_size_px=args.coarse_prompt_min_box_size_px,
         coarse_prompt_box_pad_px=args.coarse_prompt_box_pad_px,
+        sam_guided_modes=args.sam_guided_modes,
     ).to(device)
     return model
 
@@ -1878,6 +1912,129 @@ def materialize_lazy_modules(model: nn.Module, sample_image: torch.Tensor, devic
     with safe_autocast(device, amp_dtype):
         _ = model(sample_image[None].to(device), run_sam=run_sam)
     model.train(was_training)
+
+
+def set_trainable_finetune_mode(model: PromptProposalModel, mode: str) -> None:
+    """Control which proposal modules are updated when continuing from a checkpoint.
+
+    Modes:
+      all: leave the proposal decoder and all heads trainable, while SAM2 stays frozen.
+      prompt-heads-only: update only the point and box MLP heads.
+      prompt-heads-refine: update point/box MLP heads plus the shared refinement block.
+      prompt-and-coarse-heads: update point/box MLP heads plus coarse mask head.
+      proposal-heads: update all ProposalHeads modules: refine, coarse, point, and box heads.
+      decoder-and-heads: update proposal decoder plus all ProposalHeads modules.
+    """
+    mode = str(mode)
+    if hasattr(model, "sam2"):
+        freeze_module(model.sam2)
+
+    if mode == "all":
+        # SAM2 is frozen; other modules keep their default trainable status.
+        return
+
+    valid_modes = {
+        "prompt-heads-only",
+        "prompt-heads-refine",
+        "prompt-and-coarse-heads",
+        "proposal-heads",
+        "decoder-and-heads",
+    }
+    if mode not in valid_modes:
+        raise ValueError(f"Unknown --finetune-mode {mode!r}. Valid: all or {sorted(valid_modes)}")
+
+    for p in model.parameters():
+        p.requires_grad = False
+    if hasattr(model, "sam2"):
+        for p in model.sam2.parameters():
+            p.requires_grad = False
+
+    modules: List[nn.Module] = []
+    if mode in {"prompt-heads-only", "prompt-heads-refine", "prompt-and-coarse-heads", "proposal-heads", "decoder-and-heads"}:
+        modules.extend([model.heads.point_mlp, model.heads.box_mlp])
+    if mode in {"prompt-heads-refine", "proposal-heads", "decoder-and-heads"}:
+        modules.append(model.heads.refine)
+    if mode in {"prompt-and-coarse-heads", "proposal-heads", "decoder-and-heads"}:
+        modules.append(model.heads.coarse_head)
+    if mode == "decoder-and-heads":
+        modules.append(model.proposal_decoder)
+
+    for module in modules:
+        for p in module.parameters():
+            p.requires_grad = True
+
+
+def build_optimizer_param_groups(model: PromptProposalModel, args: argparse.Namespace) -> List[Dict]:
+    """Build named parameter groups with optional LR scales per branch."""
+    base_lr = float(args.lr)
+    weight_decay = float(args.weight_decay)
+    groups: List[Dict] = []
+    seen = set()
+
+    def add_group(name: str, module: nn.Module, lr_scale: float) -> None:
+        params = []
+        for p in module.parameters():
+            if p.requires_grad and id(p) not in seen:
+                params.append(p)
+                seen.add(id(p))
+        if params:
+            groups.append({
+                "params": params,
+                "lr": base_lr * float(lr_scale),
+                "weight_decay": weight_decay,
+                "name": name,
+            })
+
+    add_group("point_head", model.heads.point_mlp, args.prompt_head_lr_scale)
+    add_group("box_head", model.heads.box_mlp, args.prompt_head_lr_scale)
+    add_group("coarse_head", model.heads.coarse_head, args.coarse_head_lr_scale)
+    add_group("refine", model.heads.refine, args.refine_lr_scale)
+    add_group("proposal_decoder", model.proposal_decoder, args.decoder_lr_scale)
+
+    # Catch any remaining trainable parameters not covered above.
+    remaining = []
+    for p in model.parameters():
+        if p.requires_grad and id(p) not in seen:
+            remaining.append(p)
+            seen.add(id(p))
+    if remaining:
+        groups.append({"params": remaining, "lr": base_lr, "weight_decay": weight_decay, "name": "other"})
+    return groups
+
+
+def describe_optimizer_param_groups(optimizer: torch.optim.Optimizer) -> None:
+    for group in optimizer.param_groups:
+        n_params = sum(p.numel() for p in group["params"])
+        print(f"  optimizer group {group.get('name', 'unnamed')}: lr={group['lr']:.3e}, params={n_params:,}")
+
+
+def best_metric_value(val_log: Dict[str, float], args: argparse.Namespace) -> Tuple[float, bool]:
+    """Return (metric_value, maximize) for checkpoint selection."""
+    metric = str(args.best_metric)
+    if metric == "val_loss":
+        return float(val_log["loss"]), False
+    key_map = {
+        "val_DSC_coarse": "DSC_coarse",
+        "val_DSC_sam_point": "DSC_sam_point",
+        "val_DSC_sam_box": "DSC_sam_box",
+        "val_DSC_sam_point_box": "DSC_sam_point_box",
+    }
+    if metric in key_map:
+        return float(val_log.get(key_map[metric], 0.0)), True
+    if metric == "val_DSC_sam_mean":
+        vals = [
+            float(val_log.get(k, 0.0))
+            for k in ["DSC_sam_point", "DSC_sam_box", "DSC_sam_point_box"]
+            if float(val_log.get(k, 0.0)) > 0.0
+        ]
+        return (float(np.mean(vals)) if vals else 0.0), True
+    raise ValueError(f"Unknown --best-metric {metric!r}")
+
+
+def is_better_metric(value: float, best: float, maximize: bool, min_delta: float) -> bool:
+    if maximize:
+        return value > best + float(min_delta)
+    return value < best - float(min_delta)
 
 
 # =============================================================================
@@ -1910,6 +2067,7 @@ def curriculum_state(args: argparse.Namespace, epoch: int) -> Dict[str, object]:
             "sam_guided_loss": run_sam,
             "lambda_sam_point": float(args.lambda_sam_point) if run_sam else 0.0,
             "lambda_sam_box": float(args.lambda_sam_box) if run_sam else 0.0,
+            "lambda_sam_point_box": float(args.lambda_sam_point_box) if run_sam else 0.0,
         }
 
     warmup = int(args.curriculum_warmup_epochs)
@@ -1924,6 +2082,7 @@ def curriculum_state(args: argparse.Namespace, epoch: int) -> Dict[str, object]:
             "sam_guided_loss": False,
             "lambda_sam_point": 0.0,
             "lambda_sam_box": 0.0,
+            "lambda_sam_point_box": 0.0,
         }
 
     if ramp > 0 and epoch <= warmup + ramp:
@@ -1943,6 +2102,7 @@ def curriculum_state(args: argparse.Namespace, epoch: int) -> Dict[str, object]:
             "sam_guided_loss": run_sam,
             "lambda_sam_point": float(args.lambda_sam_point) * factor if run_sam else 0.0,
             "lambda_sam_box": float(args.lambda_sam_box) * factor if run_sam else 0.0,
+            "lambda_sam_point_box": float(args.lambda_sam_point_box) * factor if run_sam else 0.0,
         }
 
     run_sam = base_run_sam
@@ -1953,6 +2113,7 @@ def curriculum_state(args: argparse.Namespace, epoch: int) -> Dict[str, object]:
         "sam_guided_loss": run_sam,
         "lambda_sam_point": float(args.lambda_sam_point) if run_sam else 0.0,
         "lambda_sam_box": float(args.lambda_sam_box) if run_sam else 0.0,
+        "lambda_sam_point_box": float(args.lambda_sam_point_box) if run_sam else 0.0,
     }
 
 
@@ -2049,22 +2210,40 @@ def train(args: argparse.Namespace) -> None:
     sample_image = train_ds[0]["image"]
     materialize_lazy_modules(model, sample_image, device, args.amp_dtype, run_sam=False)
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    init_ckpt = None
+    if args.init_checkpoint:
+        init_ckpt = load_checkpoint(model, Path(args.init_checkpoint).expanduser().resolve(), device)
+        print(f"Initialized model weights from checkpoint: {args.init_checkpoint}")
+
+    set_trainable_finetune_mode(model, args.finetune_mode)
+    optimizer_groups = build_optimizer_param_groups(model, args)
+    if not optimizer_groups:
+        raise RuntimeError("No trainable parameters after applying --finetune-mode. Check your settings.")
+    optimizer = torch.optim.AdamW(optimizer_groups, lr=args.lr, weight_decay=args.weight_decay)
+    if init_ckpt is not None and args.resume_optimizer:
+        try:
+            optimizer.load_state_dict(init_ckpt["optimizer_state"])
+            print("Loaded optimizer state from --init-checkpoint.")
+        except Exception as exc:
+            print(f"WARNING: could not load optimizer state from --init-checkpoint: {repr(exc)}")
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and args.amp_dtype == "fp16"))
 
-    best_val = float("inf")
+    _, maximize_best_metric = best_metric_value({"loss": 0.0}, args) if args.best_metric == "val_loss" else (0.0, True)
+    best_val = -float("inf") if maximize_best_metric else float("inf")
     bad_epochs = 0
     metrics_rows: List[Dict] = []
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     print(f"Training prompt-proposal model. Output: {out_dir}")
     print(
         f"Proposal backbone: {args.proposal_backbone}; decoder={args.decoder_type}; "
         f"prompt_source={args.prompt_source}; sam_guided_loss={args.sam_guided_loss}; "
-        f"curriculum={args.curriculum_training}"
+        f"sam_guided_modes={args.sam_guided_modes}; curriculum={args.curriculum_training}; "
+        f"finetune_mode={args.finetune_mode}; best_metric={args.best_metric}"
     )
     print(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+    describe_optimizer_param_groups(optimizer)
 
     current_stage_index: Optional[int] = None
     stage_best_initialized = False
@@ -2077,7 +2256,8 @@ def train(args: argparse.Namespace) -> None:
             current_stage_index = stage_index
             current_stage_name = str(stage["stage_name"])
             bad_epochs = 0
-            best_val = float("inf")
+            _, maximize_best_metric = best_metric_value({"loss": 0.0}, args) if args.best_metric == "val_loss" else (0.0, True)
+            best_val = -float("inf") if maximize_best_metric else float("inf")
             stage_best_initialized = False
             print(
                 f"\n=== Starting curriculum stage {stage_index}: {current_stage_name} "
@@ -2090,6 +2270,7 @@ def train(args: argparse.Namespace) -> None:
             sam_guided_loss=bool(stage["sam_guided_loss"]),
             lambda_sam_point=float(stage["lambda_sam_point"]),
             lambda_sam_box=float(stage["lambda_sam_box"]),
+            lambda_sam_point_box=float(stage["lambda_sam_point_box"]),
         )
 
         train_log = run_epoch(
@@ -2123,6 +2304,7 @@ def train(args: argparse.Namespace) -> None:
             "sam_factor": float(stage["sam_factor"]),
             "effective_lambda_sam_point": float(stage["lambda_sam_point"]),
             "effective_lambda_sam_box": float(stage["lambda_sam_box"]),
+            "effective_lambda_sam_point_box": float(stage["lambda_sam_point_box"]),
             **{f"train_{k}": v for k, v in train_log.items()},
             **{f"val_{k}": v for k, v in val_log.items()},
             "lr": optimizer.param_groups[0]["lr"],
@@ -2136,26 +2318,35 @@ def train(args: argparse.Namespace) -> None:
             f"Epoch {epoch:03d}: "
             f"train_loss={train_log['loss']:.5f}, train_DSC_coarse={train_log['DSC_coarse']:.4f}, "
             f"train_DSC_sam_point={train_log['DSC_sam_point']:.4f}, train_DSC_sam_box={train_log['DSC_sam_box']:.4f}, "
+            f"train_DSC_sam_point_box={train_log['DSC_sam_point_box']:.4f}, "
             f"val_loss={val_log['loss']:.5f}, val_DSC_coarse={val_log['DSC_coarse']:.4f}, "
             f"val_DSC_sam_point={val_log['DSC_sam_point']:.4f}, val_DSC_sam_box={val_log['DSC_sam_box']:.4f}, "
+            f"val_DSC_sam_point_box={val_log['DSC_sam_point_box']:.4f}, "
             f"lr={optimizer.param_groups[0]['lr']:.3e}"
         )
 
         save_checkpoint(out_dir / "last_model.pt", model, optimizer, epoch, best_val, args)
-        val_metric = float(val_log["loss"])
+        val_metric, maximize_best_metric = best_metric_value(val_log, args)
+        row["best_metric_name"] = args.best_metric
+        row["best_metric_value"] = float(val_metric)
+        # Rewrite metrics after adding best-selection fields.
+        pd.DataFrame(metrics_rows).to_csv(out_dir / "metrics.csv", index=False)
+        with open(out_dir / "metrics.json", "w") as f:
+            json.dump(metrics_rows, f, indent=2)
+
         if not stage_best_initialized:
             best_val = val_metric
             bad_epochs = 0
             stage_best_initialized = True
             save_checkpoint(out_dir / "best_model.pt", model, optimizer, epoch, best_val, args)
             save_checkpoint(out_dir / f"best_model_stage{stage_index}_{current_stage_name}.pt", model, optimizer, epoch, best_val, args)
-            print(f"  reset stage best at val_loss={best_val:.5f} and saved best_model.pt")
-        elif val_metric < best_val - args.min_delta:
+            print(f"  reset stage best at {args.best_metric}={best_val:.5f} and saved best_model.pt")
+        elif is_better_metric(val_metric, best_val, maximize_best_metric, args.min_delta):
             best_val = val_metric
             bad_epochs = 0
             save_checkpoint(out_dir / "best_model.pt", model, optimizer, epoch, best_val, args)
             save_checkpoint(out_dir / f"best_model_stage{stage_index}_{current_stage_name}.pt", model, optimizer, epoch, best_val, args)
-            print(f"  saved best_model.pt with stage val_loss={best_val:.5f}")
+            print(f"  saved best_model.pt with stage {args.best_metric}={best_val:.5f}")
         else:
             bad_epochs += 1
             if args.patience > 0 and bad_epochs >= args.patience:
@@ -2225,6 +2416,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--unet-out-ch", type=int, default=128)
     p.add_argument("--num-prompts", type=int, default=1, help="Currently only 1 is implemented; output tensors keep a prompt dimension for future extension.")
     p.add_argument(
+        "--sam-guided-modes",
+        nargs="+",
+        choices=["point", "box", "point+box"],
+        default=["point", "box"],
+        help="Frozen MedSAM2 prompt modes used for SAM-guided losses and post-training evaluation. Include point+box to optimize the same combined prompt mode used in inference.",
+    )
+    p.add_argument(
         "--prompt-source",
         choices=["heads", "coarse-soft", "coarse-hard"],
         default="heads",
@@ -2259,7 +2457,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lambda-box-giou", type=float, default=1.0)
     p.add_argument("--lambda-sam-point", type=float, default=1.0)
     p.add_argument("--lambda-sam-box", type=float, default=1.0)
-    p.add_argument("--sam-guided-loss", action=argparse.BooleanOptionalAction, default=True, help="Use frozen MedSAM2 point/box output losses during training.")
+    p.add_argument("--lambda-sam-point-box", type=float, default=1.0, help="Loss weight for frozen-MedSAM2 point+box output when --sam-guided-modes includes point+box.")
+    p.add_argument("--sam-guided-loss", action=argparse.BooleanOptionalAction, default=True, help="Use frozen MedSAM2 prompted-output losses during training.")
+
+    # Checkpoint continuation / targeted fine-tuning
+    p.add_argument("--init-checkpoint", default=None, help="Optional previous prompt-proposal checkpoint to initialize from before fine-tuning.")
+    p.add_argument("--resume-optimizer", action=argparse.BooleanOptionalAction, default=False, help="Also try to load optimizer state from --init-checkpoint. Usually disable when changing --finetune-mode or LR groups.")
+    p.add_argument(
+        "--finetune-mode",
+        choices=["all", "prompt-heads-only", "prompt-heads-refine", "prompt-and-coarse-heads", "proposal-heads", "decoder-and-heads"],
+        default="all",
+        help=(
+            "Which modules to train after optional checkpoint initialization. "
+            "Use prompt-heads-only to update only point_mlp/box_mlp; "
+            "use prompt-and-coarse-heads to update point, box, and coarse heads; "
+            "use proposal-heads to include the shared refinement block."
+        ),
+    )
+    p.add_argument("--prompt-head-lr-scale", type=float, default=1.0, help="LR multiplier for point and box heads.")
+    p.add_argument("--coarse-head-lr-scale", type=float, default=1.0, help="LR multiplier for the coarse mask head. Use e.g. 0.05-0.2 to keep the coarse mask changing slowly.")
+    p.add_argument("--refine-lr-scale", type=float, default=1.0, help="LR multiplier for the shared ProposalHeads refinement block.")
+    p.add_argument("--decoder-lr-scale", type=float, default=1.0, help="LR multiplier for proposal_decoder when it is trainable.")
+    p.add_argument(
+        "--best-metric",
+        choices=["val_loss", "val_DSC_coarse", "val_DSC_sam_point", "val_DSC_sam_box", "val_DSC_sam_point_box", "val_DSC_sam_mean"],
+        default="val_loss",
+        help="Metric used to save best_model.pt and early-stop. DSC metrics are maximized; val_loss is minimized.",
+    )
 
     # Curriculum / staged training
     p.add_argument("--curriculum-training", action=argparse.BooleanOptionalAction, default=False,
@@ -2361,6 +2585,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "lambda_box_giou",
         "lambda_sam_point",
         "lambda_sam_box",
+        "lambda_sam_point_box",
     ]:
         if getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
@@ -2368,6 +2593,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("At least one coarse mask loss weight must be positive")
     if args.sam_guided_loss and args.sam_bce_weight + args.sam_dice_weight <= 0:
         raise ValueError("At least one SAM mask loss weight must be positive when --sam-guided-loss is enabled")
+    for name in ["prompt_head_lr_scale", "coarse_head_lr_scale", "refine_lr_scale", "decoder_lr_scale"]:
+        if getattr(args, name) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
+    if args.best_metric == "val_DSC_sam_point_box" and "point+box" not in args.sam_guided_modes:
+        print("WARNING: --best-metric val_DSC_sam_point_box requires --sam-guided-modes point+box; otherwise it will remain 0.")
+    if args.best_metric == "val_DSC_sam_point" and "point" not in args.sam_guided_modes:
+        print("WARNING: --best-metric val_DSC_sam_point requires --sam-guided-modes point; otherwise it will remain 0.")
+    if args.best_metric == "val_DSC_sam_box" and "box" not in args.sam_guided_modes:
+        print("WARNING: --best-metric val_DSC_sam_box requires --sam-guided-modes box; otherwise it will remain 0.")
     if args.proposal_backbone == "unet" and args.decoder_type != "fpn":
         print("NOTE: --decoder-type is ignored with --proposal-backbone unet")
     if args.aug_scale_min <= 0 or args.aug_scale_max <= 0 or args.aug_scale_min > args.aug_scale_max:
