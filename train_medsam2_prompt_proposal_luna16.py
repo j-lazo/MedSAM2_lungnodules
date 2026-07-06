@@ -933,7 +933,13 @@ class ProposalHeads(nn.Module):
         H, W = int(input_hw[0]), int(input_hw[1])
         feat_full = F.interpolate(feat, size=input_hw, mode="bilinear", align_corners=False) if feat.shape[-2:] != input_hw else feat
         feat_full = self.refine(feat_full)
-        coarse_logits = feat_full #self.coarse_head(feat_full)
+
+        # Full-resolution fine mask prediction. Keep the key name `coarse_logits`
+        # for backward compatibility with the rest of the script, but make it
+        # exactly the same tensor as the fine-grained mask output used for
+        # coarse-soft/coarse-hard prompt extraction.
+        fine_mask_logits = self.coarse_head(feat_full)
+        coarse_logits = fine_mask_logits
 
         pooled = self.pool(feat_full)
         point_raw = self.point_mlp(pooled).view(-1, self.num_prompts, 2)
@@ -952,8 +958,11 @@ class ProposalHeads(nn.Module):
         box_xyxy = torch.cat([x1y1, x2y2], dim=-1)
         box_xyxy = clip_boxes_torch(box_xyxy, H=H, W=W)
 
+         # Backward-compatible alias. Downstream losses, evaluation, and
+        # coarse-soft/coarse-hard prompt extraction all use this tensor.
         return {
             "proposal_features": feat_full,
+            "fine_mask_logits": fine_mask_logits,
             "coarse_logits": coarse_logits,
             "point_xy": point_xy,
             "box_xyxy": box_xyxy,
