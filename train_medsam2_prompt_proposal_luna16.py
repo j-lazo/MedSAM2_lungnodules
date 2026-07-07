@@ -823,13 +823,21 @@ class FPNFeatureDecoder(nn.Module):
             raise ValueError(f"FPN requested {self.num_levels} levels, but SAM2 returned only {len(feats)}")
         if len(feats) > self.num_levels:
             feats = feats[-self.num_levels:]
+        fused_levels: List[torch.Tensor] = []
         y = self.lateral_convs[0](feats[0])
         y = self.smooth_convs[0](y)
+        fused_levels.append(y)
         for i in range(1, len(feats)):
             lateral = self.lateral_convs[i](feats[i])
             y = F.interpolate(y, size=lateral.shape[-2:], mode="bilinear", align_corners=False)
             y = y + lateral
             y = self.smooth_convs[i](y)
+            fused_levels.append(y)
+
+        # Store the top-down fused pyramid for optional spatial prompt heads.
+        # The list is low-resolution -> high-resolution, and the returned tensor
+        # remains the final/highest-resolution fused feature as before.
+        self.last_pyramid_features = fused_levels
         return y
 
 
@@ -902,45 +910,91 @@ class SmallUNetFeatureExtractor(nn.Module):
 
 
 class ProposalHeads(nn.Module):
-    def __init__(self, in_ch: int, hidden_ch: int = 256, num_prompts: int = 1, dropout: float = 0.0):
+    def __init__(
+        self,
+        in_ch: int,
+        hidden_ch: int = 256,
+        num_prompts: int = 1,
+        dropout: float = 0.0,
+        prompt_head_type: str = "mlp",
+        spatial_head_use_pyramid: bool = False,
+        spatial_head_pyramid_levels: int = 3,
+        spatial_head_temperature: float = 0.25,
+        spatial_head_detach_coarse_probs: bool = False,
+        spatial_box_min_size_px: float = 3.0,
+    ):
         super().__init__()
         self.num_prompts = int(num_prompts)
         if self.num_prompts != 1:
             raise NotImplementedError(
-                "This first implementation supports one proposal per positive slice. "
-                "The tensors keep an [N] prompt dimension so multi-prompt matching can be added later."
+                "This implementation still supports one learned proposal per positive slice. "
+                "Use --prompt-source coarse-hard for multiple component prompts from the coarse mask."
             )
+        self.prompt_head_type = str(prompt_head_type)
+        if self.prompt_head_type not in {"mlp", "spatial"}:
+            raise ValueError("prompt_head_type must be 'mlp' or 'spatial'")
+        self.spatial_head_use_pyramid = bool(spatial_head_use_pyramid)
+        self.spatial_head_pyramid_levels = max(1, int(spatial_head_pyramid_levels))
+        self.spatial_head_temperature = float(max(spatial_head_temperature, 1e-4))
+        self.spatial_head_detach_coarse_probs = bool(spatial_head_detach_coarse_probs)
+        self.spatial_box_min_size_px = float(max(spatial_box_min_size_px, 1.0))
+
         self.refine = nn.Sequential(
             ConvGNAct(in_ch, hidden_ch, dropout=dropout),
             ConvGNAct(hidden_ch, hidden_ch, dropout=dropout),
         )
         self.coarse_head = nn.Conv2d(hidden_ch, 1, kernel_size=1)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.point_mlp = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(hidden_ch, hidden_ch),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_ch, self.num_prompts * 2),
-        )
-        self.box_mlp = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(hidden_ch, hidden_ch),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_ch, self.num_prompts * 4),
-        )
 
-    def forward(self, feat: torch.Tensor, input_hw: Tuple[int, int]) -> Dict[str, torch.Tensor]:
-        H, W = int(input_hw[0]), int(input_hw[1])
-        feat_full = F.interpolate(feat, size=input_hw, mode="bilinear", align_corners=False) if feat.shape[-2:] != input_hw else feat
-        feat_full = self.refine(feat_full)
+        # Original global-regression prompt heads. These are kept so older
+        # checkpoints can still be loaded when --prompt-head-type mlp is used.
+        if self.prompt_head_type == "mlp":
+            self.pool = nn.AdaptiveAvgPool2d(1)
+            self.point_mlp = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(hidden_ch, hidden_ch),
+                nn.SiLU(inplace=True),
+                nn.Linear(hidden_ch, self.num_prompts * 2),
+            )
+            self.box_mlp = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(hidden_ch, hidden_ch),
+                nn.SiLU(inplace=True),
+                nn.Linear(hidden_ch, self.num_prompts * 4),
+            )
+            self.spatial_prompt_head = nn.Identity()
+            self.point_heatmap_head = nn.Identity()
+            self.box_distance_head = nn.Identity()
+        else:
+            self.pool = nn.Identity()
+            self.point_mlp = nn.Identity()
+            self.box_mlp = nn.Identity()
+            # Input is [feat_full, sigmoid(coarse_logits), x_coord, y_coord]
+            # plus optional FPN fused pyramid levels. LazyConv2d lets the same
+            # code work whether pyramid features are concatenated or not.
+            self.spatial_prompt_head = nn.Sequential(
+                nn.LazyConv2d(hidden_ch, kernel_size=1),
+                nn.GroupNorm(self._num_groups(hidden_ch), hidden_ch),
+                nn.SiLU(inplace=True),
+                ConvGNAct(hidden_ch, hidden_ch, dropout=dropout),
+                ConvGNAct(hidden_ch, hidden_ch, dropout=dropout),
+            )
+            self.point_heatmap_head = nn.Conv2d(hidden_ch, self.num_prompts, kernel_size=1)
+            self.box_distance_head = nn.Conv2d(hidden_ch, self.num_prompts * 4, kernel_size=1)
 
-        # Full-resolution fine mask prediction. Keep the key name `coarse_logits`
-        # for backward compatibility with the rest of the script, but make it
-        # exactly the same tensor as the fine-grained mask output used for
-        # coarse-soft/coarse-hard prompt extraction.
-        fine_mask_logits = self.coarse_head(feat_full)
-        coarse_logits = fine_mask_logits
+    @staticmethod
+    def _num_groups(ch: int, max_groups: int = 8) -> int:
+        g = min(max_groups, int(ch))
+        while ch % g != 0 and g > 1:
+            g -= 1
+        return g
 
+    @staticmethod
+    def _coord_maps(batch_size: int, H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        yy = torch.linspace(0.0, 1.0, H, device=device, dtype=dtype).view(1, 1, H, 1).expand(batch_size, 1, H, W)
+        xx = torch.linspace(0.0, 1.0, W, device=device, dtype=dtype).view(1, 1, 1, W).expand(batch_size, 1, H, W)
+        return torch.cat([xx, yy], dim=1)
+
+    def _mlp_prompts(self, feat_full: torch.Tensor, H: int, W: int) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         pooled = self.pool(feat_full)
         point_raw = self.point_mlp(pooled).view(-1, self.num_prompts, 2)
         point01 = torch.sigmoid(point_raw)
@@ -957,16 +1011,104 @@ class ProposalHeads(nn.Module):
         x2y2 = center_xy + 0.5 * wh_xy
         box_xyxy = torch.cat([x1y1, x2y2], dim=-1)
         box_xyxy = clip_boxes_torch(box_xyxy, H=H, W=W)
+        return point_xy, box_xyxy, {}
 
-         # Backward-compatible alias. Downstream losses, evaluation, and
-        # coarse-soft/coarse-hard prompt extraction all use this tensor.
-        return {
+    def _spatial_prompts(
+        self,
+        feat_full: torch.Tensor,
+        coarse_logits: torch.Tensor,
+        H: int,
+        W: int,
+        pyramid_features: Optional[Sequence[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        B = int(feat_full.shape[0])
+        prompt_inputs: List[torch.Tensor] = [feat_full]
+
+        coarse_probs = torch.sigmoid(coarse_logits)
+        if self.spatial_head_detach_coarse_probs:
+            coarse_probs = coarse_probs.detach()
+        prompt_inputs.append(coarse_probs)
+        prompt_inputs.append(self._coord_maps(B, H, W, feat_full.device, feat_full.dtype))
+
+        if self.spatial_head_use_pyramid and pyramid_features:
+            # Use the top-down FPN fused levels directly in the prompt head.
+            # This gives the point/box CNN access to both high-level context and
+            # higher-resolution detail instead of relying only on the final feature.
+            selected = list(pyramid_features)[-self.spatial_head_pyramid_levels:]
+            for pf in selected:
+                pf_full = F.interpolate(pf, size=(H, W), mode="bilinear", align_corners=False)
+                prompt_inputs.append(pf_full)
+
+        prompt_feat = torch.cat(prompt_inputs, dim=1)
+        prompt_feat = self.spatial_prompt_head(prompt_feat)
+        point_heatmap_logits = self.point_heatmap_head(prompt_feat)  # [B,1,H,W]
+        box_distance_logits = self.box_distance_head(prompt_feat).view(B, self.num_prompts, 4, H, W)
+
+        # Differentiable soft-argmax for the point. This keeps the direct SAM loss
+        # connected to the spatial heatmap head when --prompt-source heads is used.
+        heat = point_heatmap_logits.view(B, self.num_prompts, -1) / self.spatial_head_temperature
+        heat_weights = F.softmax(heat, dim=-1).view(B, self.num_prompts, H, W)
+        ys = torch.arange(H, dtype=feat_full.dtype, device=feat_full.device).view(1, 1, H, 1)
+        xs = torch.arange(W, dtype=feat_full.dtype, device=feat_full.device).view(1, 1, 1, W)
+        cx = (heat_weights * xs).sum(dim=(2, 3))
+        cy = (heat_weights * ys).sum(dim=(2, 3))
+        point_xy = torch.stack([cx, cy], dim=-1)
+
+        # FCOS-like box distances. Distances are sampled/averaged using the same
+        # point heatmap, then converted to xyxy coordinates.
+        distances = F.softplus(box_distance_logits) + (0.5 * self.spatial_box_min_size_px)
+        weighted_distances = (distances * heat_weights[:, :, None, :, :]).sum(dim=(3, 4))
+        left = weighted_distances[..., 0]
+        top = weighted_distances[..., 1]
+        right = weighted_distances[..., 2]
+        bottom = weighted_distances[..., 3]
+        box_xyxy = torch.stack([cx - left, cy - top, cx + right, cy + bottom], dim=-1)
+        box_xyxy = clip_boxes_torch(box_xyxy, H=H, W=W)
+
+        aux = {
+            "point_heatmap_logits": point_heatmap_logits,
+            "box_distance_logits": box_distance_logits.view(B, self.num_prompts * 4, H, W),
+            "prompt_heatmap_probs": heat_weights,
+        }
+        return point_xy, box_xyxy, aux
+
+    def forward(
+        self,
+        feat: torch.Tensor,
+        input_hw: Tuple[int, int],
+        pyramid_features: Optional[Sequence[torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        H, W = int(input_hw[0]), int(input_hw[1])
+        feat_full = F.interpolate(feat, size=input_hw, mode="bilinear", align_corners=False) if feat.shape[-2:] != input_hw else feat
+        feat_full = self.refine(feat_full)
+
+        # Full-resolution fine mask prediction. Keep the key name `coarse_logits`
+        # for backward compatibility with the rest of the script, but make it
+        # exactly the same tensor as the fine-grained mask output used for
+        # coarse-soft/coarse-hard prompt extraction.
+        fine_mask_logits = self.coarse_head(feat_full)
+        coarse_logits = fine_mask_logits
+
+        if self.prompt_head_type == "spatial":
+            point_xy, box_xyxy, aux = self._spatial_prompts(
+                feat_full,
+                coarse_logits,
+                H,
+                W,
+                pyramid_features=pyramid_features,
+            )
+        else:
+            point_xy, box_xyxy, aux = self._mlp_prompts(feat_full, H, W)
+
+        out = {
             "proposal_features": feat_full,
             "fine_mask_logits": fine_mask_logits,
             "coarse_logits": coarse_logits,
             "point_xy": point_xy,
             "box_xyxy": box_xyxy,
         }
+        out.update(aux)
+        return out
 
 
 # -----------------------------------------------------------------------------
@@ -1482,6 +1624,12 @@ class PromptProposalModel(nn.Module):
         coarse_prompt_box_pad_px: int = 0,
         coarse_hard_max_components: int = 3,
         coarse_hard_min_component_area: int = 1,
+        prompt_head_type: str = "mlp",
+        spatial_head_use_pyramid: bool = False,
+        spatial_head_pyramid_levels: int = 3,
+        spatial_head_temperature: float = 0.25,
+        spatial_head_detach_coarse_probs: bool = False,
+        spatial_box_min_size_px: float = 3.0,
         sam_guided_modes: Sequence[str] = ("point", "box"),
     ):
         super().__init__()
@@ -1495,6 +1643,12 @@ class PromptProposalModel(nn.Module):
         self.coarse_prompt_box_pad_px = int(coarse_prompt_box_pad_px)
         self.coarse_hard_max_components = int(coarse_hard_max_components)
         self.coarse_hard_min_component_area = int(coarse_hard_min_component_area)
+        self.prompt_head_type = str(prompt_head_type)
+        self.spatial_head_use_pyramid = bool(spatial_head_use_pyramid)
+        self.spatial_head_pyramid_levels = int(spatial_head_pyramid_levels)
+        self.spatial_head_temperature = float(spatial_head_temperature)
+        self.spatial_head_detach_coarse_probs = bool(spatial_head_detach_coarse_probs)
+        self.spatial_box_min_size_px = float(spatial_box_min_size_px)
         self.sam_guided_modes = tuple(str(m) for m in sam_guided_modes)
         bad_modes = sorted(set(self.sam_guided_modes) - {"point", "box", "point+box"})
         if bad_modes:
@@ -1536,19 +1690,27 @@ class PromptProposalModel(nn.Module):
             hidden_ch=decoder_dim,
             num_prompts=num_prompts,
             dropout=decoder_dropout,
+            prompt_head_type=self.prompt_head_type,
+            spatial_head_use_pyramid=self.spatial_head_use_pyramid,
+            spatial_head_pyramid_levels=self.spatial_head_pyramid_levels,
+            spatial_head_temperature=self.spatial_head_temperature,
+            spatial_head_detach_coarse_probs=self.spatial_head_detach_coarse_probs,
+            spatial_box_min_size_px=self.spatial_box_min_size_px,
         )
 
-    def extract_proposal_features(self, x: torch.Tensor) -> torch.Tensor:
+    def extract_proposal_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
         if self.proposal_backbone == "unet":
-            return self.proposal_decoder(x)
+            return self.proposal_decoder(x), None
         feats = extract_sam2_features(self.sam2, x, no_grad=True)
         if self.decoder_type == "fpn":
-            return self.proposal_decoder(feats)
-        return self.proposal_decoder(feats[-1])
+            feat = self.proposal_decoder(feats)
+            pyramid = getattr(self.proposal_decoder, "last_pyramid_features", None)
+            return feat, pyramid
+        return self.proposal_decoder(feats[-1]), None
 
     def forward(self, x: torch.Tensor, run_sam: bool = True) -> Dict[str, torch.Tensor]:
-        feat = self.extract_proposal_features(x)
-        out = self.heads(feat, input_hw=x.shape[-2:])
+        feat, pyramid_features = self.extract_proposal_features(x)
+        out = self.heads(feat, input_hw=x.shape[-2:], pyramid_features=pyramid_features)
 
         # Keep raw head outputs for diagnostics even when the prompts actually sent
         # to MedSAM2 are derived from the predicted coarse mask.
@@ -2116,6 +2278,12 @@ def build_model(args: argparse.Namespace, device: torch.device) -> PromptProposa
         coarse_prompt_box_pad_px=args.coarse_prompt_box_pad_px,
         coarse_hard_max_components=args.coarse_hard_max_components,
         coarse_hard_min_component_area=args.coarse_hard_min_component_area,
+        prompt_head_type=args.prompt_head_type,
+        spatial_head_use_pyramid=args.spatial_head_use_pyramid,
+        spatial_head_pyramid_levels=args.spatial_head_pyramid_levels,
+        spatial_head_temperature=args.spatial_head_temperature,
+        spatial_head_detach_coarse_probs=args.spatial_head_detach_coarse_probs,
+        spatial_box_min_size_px=args.spatial_box_min_size_px,
         sam_guided_modes=args.sam_guided_modes,
     ).to(device)
     return model
@@ -2136,10 +2304,10 @@ def set_trainable_finetune_mode(model: PromptProposalModel, mode: str) -> None:
 
     Modes:
       all: leave the proposal decoder and all heads trainable, while SAM2 stays frozen.
-      prompt-heads-only: update only the point and box MLP heads.
-      prompt-heads-refine: update point/box MLP heads plus the shared refinement block.
-      prompt-and-coarse-heads: update point/box MLP heads plus coarse mask head.
-      proposal-heads: update all ProposalHeads modules: refine, coarse, point, and box heads.
+      prompt-heads-only: update only the learned prompt head (MLP or spatial heatmap/distance head).
+      prompt-heads-refine: update the prompt head plus the shared refinement block.
+      prompt-and-coarse-heads: update prompt head plus coarse/fine mask head.
+      proposal-heads: update all ProposalHeads modules: refine, coarse, prompt, and box heads.
       decoder-and-heads: update proposal decoder plus all ProposalHeads modules.
     """
     mode = str(mode)
@@ -2167,8 +2335,20 @@ def set_trainable_finetune_mode(model: PromptProposalModel, mode: str) -> None:
             p.requires_grad = False
 
     modules: List[nn.Module] = []
+    prompt_modules: List[nn.Module] = []
+    if hasattr(model.heads, "point_mlp"):
+        prompt_modules.append(model.heads.point_mlp)
+    if hasattr(model.heads, "box_mlp"):
+        prompt_modules.append(model.heads.box_mlp)
+    if hasattr(model.heads, "spatial_prompt_head"):
+        prompt_modules.append(model.heads.spatial_prompt_head)
+    if hasattr(model.heads, "point_heatmap_head"):
+        prompt_modules.append(model.heads.point_heatmap_head)
+    if hasattr(model.heads, "box_distance_head"):
+        prompt_modules.append(model.heads.box_distance_head)
+
     if mode in {"prompt-heads-only", "prompt-heads-refine", "prompt-and-coarse-heads", "proposal-heads", "decoder-and-heads"}:
-        modules.extend([model.heads.point_mlp, model.heads.box_mlp])
+        modules.extend(prompt_modules)
     if mode in {"prompt-heads-refine", "proposal-heads", "decoder-and-heads"}:
         modules.append(model.heads.refine)
     if mode in {"prompt-and-coarse-heads", "proposal-heads", "decoder-and-heads"}:
@@ -2204,6 +2384,12 @@ def build_optimizer_param_groups(model: PromptProposalModel, args: argparse.Name
 
     add_group("point_head", model.heads.point_mlp, args.prompt_head_lr_scale)
     add_group("box_head", model.heads.box_mlp, args.prompt_head_lr_scale)
+    if hasattr(model.heads, "spatial_prompt_head"):
+        add_group("spatial_prompt_head", model.heads.spatial_prompt_head, args.prompt_head_lr_scale)
+    if hasattr(model.heads, "point_heatmap_head"):
+        add_group("point_heatmap_head", model.heads.point_heatmap_head, args.prompt_head_lr_scale)
+    if hasattr(model.heads, "box_distance_head"):
+        add_group("box_distance_head", model.heads.box_distance_head, args.prompt_head_lr_scale)
     add_group("coarse_head", model.heads.coarse_head, args.coarse_head_lr_scale)
     add_group("refine", model.heads.refine, args.refine_lr_scale)
     add_group("proposal_decoder", model.proposal_decoder, args.decoder_lr_scale)
@@ -2455,7 +2641,8 @@ def train(args: argparse.Namespace) -> None:
     print(f"Training prompt-proposal model. Output: {out_dir}")
     print(
         f"Proposal backbone: {args.proposal_backbone}; decoder={args.decoder_type}; "
-        f"prompt_source={args.prompt_source}; sam_guided_loss={args.sam_guided_loss}; "
+        f"prompt_source={args.prompt_source}; prompt_head_type={args.prompt_head_type}; "
+        f"spatial_use_pyramid={args.spatial_head_use_pyramid}; sam_guided_loss={args.sam_guided_loss}; "
         f"sam_guided_modes={args.sam_guided_modes}; curriculum={args.curriculum_training}; "
         f"finetune_mode={args.finetune_mode}; best_metric={args.best_metric}"
     )
@@ -2631,7 +2818,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--decoder-dropout", type=float, default=0.0)
     p.add_argument("--unet-base-ch", type=int, default=32)
     p.add_argument("--unet-out-ch", type=int, default=128)
-    p.add_argument("--num-prompts", type=int, default=1, help="Currently only 1 is implemented; output tensors keep a prompt dimension for future extension.")
+    p.add_argument("--num-prompts", type=int, default=1, help="Currently only 1 learned prompt is implemented. Use --prompt-source coarse-hard for multiple component prompts from the coarse mask.")
+    p.add_argument(
+        "--prompt-head-type",
+        choices=["mlp", "spatial"],
+        default="mlp",
+        help=(
+            "Type of learned point/box head used when --prompt-source heads. "
+            "'mlp' is the original global pooled coordinate regressor. "
+            "'spatial' uses feat_full + coarse mask probability + coordinate maps, "
+            "then predicts a point heatmap and box-distance maps with a CNN."
+        ),
+    )
+    p.add_argument(
+        "--spatial-head-use-pyramid",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="With --prompt-head-type spatial and --decoder-type fpn, concatenate the fused FPN levels into the spatial prompt CNN.",
+    )
+    p.add_argument("--spatial-head-pyramid-levels", type=int, default=3, help="Number of fused FPN levels to concatenate in the spatial prompt CNN.")
+    p.add_argument("--spatial-head-temperature", type=float, default=0.25, help="Soft-argmax temperature for the point heatmap. Smaller values make the point sharper.")
+    p.add_argument(
+        "--spatial-head-detach-coarse-probs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Detach sigmoid(coarse_logits) before feeding it into the spatial prompt head. Default keeps gradients connected.",
+    )
+    p.add_argument("--spatial-box-min-size-px", type=float, default=3.0, help="Minimum distance bias, in pixels, for spatial box-distance predictions.")
     p.add_argument(
         "--sam-guided-modes",
         nargs="+",
@@ -2792,7 +3005,17 @@ def validate_args(args: argparse.Namespace) -> None:
     if not (0.0 <= args.decoder_dropout < 1.0):
         raise ValueError("--decoder-dropout must be in [0, 1)")
     if args.num_prompts != 1:
-        raise ValueError("This first implementation supports --num-prompts 1 only")
+        raise ValueError("This implementation supports --num-prompts 1 for learned heads. Use --prompt-source coarse-hard for multi-component prompts.")
+    if args.spatial_head_pyramid_levels < 1:
+        raise ValueError("--spatial-head-pyramid-levels must be >= 1")
+    if args.spatial_head_temperature <= 0:
+        raise ValueError("--spatial-head-temperature must be > 0")
+    if args.spatial_box_min_size_px < 1:
+        raise ValueError("--spatial-box-min-size-px must be >= 1")
+    if args.spatial_head_use_pyramid and args.decoder_type != "fpn":
+        print("NOTE: --spatial-head-use-pyramid only has an effect with --decoder-type fpn")
+    if args.prompt_head_type == "spatial" and args.prompt_source != "heads":
+        print("NOTE: --prompt-head-type spatial creates spatial learned heads, but prompt_source will overwrite prompts unless --prompt-source heads is used.")
     if args.prompt_source == "coarse-hard" and args.supervise_derived_prompts:
         print("NOTE: --supervise-derived-prompts has no effect with --prompt-source coarse-hard because hard extraction is non-differentiable.")
     if args.coarse_prompt_min_box_size_px < 1:
