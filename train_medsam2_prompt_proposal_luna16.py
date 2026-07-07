@@ -1023,37 +1023,23 @@ def soft_prompts_from_coarse_logits(
     return point_xy, box_xyxy
 
 
-def _largest_component_prompt_from_prob_np(
-    prob_2d: np.ndarray,
-    threshold: float,
+def _postprocess_component_box_np(
+    box: np.ndarray,
+    image_shape_hw: Tuple[int, int],
     min_box_size_px: int,
     box_pad_px: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Hard, non-differentiable prompt extraction from one probability map."""
-    prob = np.asarray(prob_2d, dtype=np.float32)
-    H, W = prob.shape
-    mask = (prob >= float(threshold)).astype(np.uint8)
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if num > 1:
-        # Ignore background row 0 and keep the largest predicted component.
-        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        mask = (labels == largest).astype(np.uint8)
-    if mask.sum() == 0:
-        y, x = np.unravel_index(int(np.argmax(prob)), prob.shape)
-        half = max(1, int(min_box_size_px)) / 2.0
-        point = np.array([float(x), float(y)], dtype=np.float32)
-        box = np.array([x - half, y - half, x + half, y + half], dtype=np.float32)
-    else:
-        point, box, _ = mask_to_box_and_point(mask)
+) -> np.ndarray:
+    """Pad/clip one xyxy box and enforce a minimum side length."""
+    H, W = image_shape_hw
+    box = np.asarray(box, dtype=np.float32).copy()
 
     if box_pad_px != 0:
-        box = box.astype(np.float32).copy()
         box[0] -= float(box_pad_px)
         box[1] -= float(box_pad_px)
         box[2] += float(box_pad_px)
         box[3] += float(box_pad_px)
 
-    # Enforce a minimum size while preserving center when possible.
+    # Enforce a minimum size while preserving the center when possible.
     cx = 0.5 * (float(box[0]) + float(box[2]))
     cy = 0.5 * (float(box[1]) + float(box[3]))
     min_size = max(1.0, float(min_box_size_px))
@@ -1064,13 +1050,113 @@ def _largest_component_prompt_from_prob_np(
         half = 0.5 * (min_size - 1.0)
         box[1], box[3] = cy - half, cy + half
 
+    # Shift back into bounds while preserving size when possible.
+    if box[0] < 0:
+        box[2] -= box[0]
+        box[0] = 0.0
+    if box[2] > W - 1:
+        box[0] -= box[2] - (W - 1)
+        box[2] = float(W - 1)
+    if box[1] < 0:
+        box[3] -= box[1]
+        box[1] = 0.0
+    if box[3] > H - 1:
+        box[1] -= box[3] - (H - 1)
+        box[3] = float(H - 1)
+
     box[0] = np.clip(box[0], 0, W - 1)
     box[2] = np.clip(box[2], 0, W - 1)
     box[1] = np.clip(box[1], 0, H - 1)
     box[3] = np.clip(box[3], 0, H - 1)
     x1, x2 = min(box[0], box[2]), max(box[0], box[2])
     y1, y2 = min(box[1], box[3]), max(box[1], box[3])
-    return point.astype(np.float32), np.array([x1, y1, x2, y2], dtype=np.float32)
+    return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+
+def _component_prompts_from_prob_np(
+    prob_2d: np.ndarray,
+    threshold: float,
+    min_box_size_px: int,
+    box_pad_px: int,
+    max_components: int,
+    min_component_area: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract one point/box prompt per connected foreground component.
+
+    Returns padded arrays with shapes:
+      points_xy: [max_components, 2]
+      boxes_xyxy: [max_components, 4]
+      valid: [max_components]
+
+    Components are sorted by descending area, so the first prompt is the largest
+    predicted component. If the thresholded map is empty, a single fallback prompt
+    is placed at the maximum-probability pixel.
+    """
+    prob = np.asarray(prob_2d, dtype=np.float32)
+    H, W = prob.shape
+    max_components = max(1, int(max_components))
+    min_component_area = max(1, int(min_component_area))
+
+    mask = (prob >= float(threshold)).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    components: List[Tuple[int, int]] = []
+    for lab in range(1, num):
+        area = int(stats[lab, cv2.CC_STAT_AREA])
+        if area >= min_component_area:
+            components.append((area, lab))
+    components.sort(key=lambda x: x[0], reverse=True)
+    components = components[:max_components]
+
+    points: List[np.ndarray] = []
+    boxes: List[np.ndarray] = []
+    valid: List[float] = []
+
+    for _, lab in components:
+        component_mask = (labels == lab).astype(np.uint8)
+        if component_mask.sum() == 0:
+            continue
+        point, box, is_valid = mask_to_box_and_point(component_mask)
+        if float(is_valid) <= 0.0:
+            continue
+        box = _postprocess_component_box_np(
+            box,
+            image_shape_hw=(H, W),
+            min_box_size_px=min_box_size_px,
+            box_pad_px=box_pad_px,
+        )
+        points.append(point.astype(np.float32))
+        boxes.append(box.astype(np.float32))
+        valid.append(1.0)
+
+    # Fallback: no connected component survived the threshold/min-area filter.
+    # Use the maximum-probability pixel and a small box around it.
+    if not points:
+        y, x = np.unravel_index(int(np.argmax(prob)), prob.shape)
+        half = max(1, int(min_box_size_px)) / 2.0
+        point = np.array([float(x), float(y)], dtype=np.float32)
+        box = np.array([x - half, y - half, x + half, y + half], dtype=np.float32)
+        box = _postprocess_component_box_np(
+            box,
+            image_shape_hw=(H, W),
+            min_box_size_px=min_box_size_px,
+            box_pad_px=box_pad_px,
+        )
+        points.append(point)
+        boxes.append(box)
+        valid.append(1.0)
+
+    # Pad to a fixed [max_components] dimension so batching stays simple.
+    while len(points) < max_components:
+        points.append(np.array([W / 2.0, H / 2.0], dtype=np.float32))
+        boxes.append(np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32))
+        valid.append(0.0)
+
+    return (
+        np.stack(points[:max_components], axis=0).astype(np.float32),
+        np.stack(boxes[:max_components], axis=0).astype(np.float32),
+        np.asarray(valid[:max_components], dtype=np.float32),
+    )
 
 
 def hard_prompts_from_coarse_logits(
@@ -1078,28 +1164,47 @@ def hard_prompts_from_coarse_logits(
     threshold: float = 0.5,
     min_box_size_px: int = 3,
     box_pad_px: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Hard prompt extraction from predicted coarse masks.
+    max_components: int = 3,
+    min_component_area: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Hard multi-component prompt extraction from predicted coarse/fine mask logits.
 
-    This exactly follows the usual threshold/component/bbox logic but is not
-    differentiable. It is useful as an ablation and for inference, but SAM-guided
-    losses will not backpropagate through this extraction step.
+    The predicted mask is thresholded, disconnected foreground blobs are treated as
+    separate candidate nodules, and one interior point + one bounding box is
+    extracted per component. Components are processed separately by frozen MedSAM2,
+    then the resulting logits are combined with a max operation.
+
+    This extraction is non-differentiable. It is useful for inference-style
+    training/evaluation, but SAM-guided losses will not backpropagate through the
+    threshold/connected-component step.
     """
+    if coarse_logits.ndim != 4 or coarse_logits.shape[1] != 1:
+        raise ValueError(f"Expected coarse_logits [B,1,H,W], got {tuple(coarse_logits.shape)}")
+
+    # The coarse/fine mask head is trained with BCEWithLogits, so convert logits
+    # to probabilities before applying the probability threshold.
     probs = torch.sigmoid(coarse_logits).detach().float().cpu().numpy()[:, 0]
+
     points: List[np.ndarray] = []
     boxes: List[np.ndarray] = []
+    valid: List[np.ndarray] = []
     for prob in probs:
-        p, b = _largest_component_prompt_from_prob_np(
+        p, b, v = _component_prompts_from_prob_np(
             prob,
             threshold=threshold,
             min_box_size_px=min_box_size_px,
             box_pad_px=box_pad_px,
+            max_components=max_components,
+            min_component_area=min_component_area,
         )
         points.append(p)
         boxes.append(b)
-    point_xy = torch.as_tensor(np.stack(points, axis=0), dtype=coarse_logits.dtype, device=coarse_logits.device)[:, None, :]
-    box_xyxy = torch.as_tensor(np.stack(boxes, axis=0), dtype=coarse_logits.dtype, device=coarse_logits.device)[:, None, :]
-    return point_xy, box_xyxy
+        valid.append(v)
+
+    point_xy = torch.as_tensor(np.stack(points, axis=0), dtype=coarse_logits.dtype, device=coarse_logits.device)
+    box_xyxy = torch.as_tensor(np.stack(boxes, axis=0), dtype=coarse_logits.dtype, device=coarse_logits.device)
+    prompt_valid = torch.as_tensor(np.stack(valid, axis=0), dtype=coarse_logits.dtype, device=coarse_logits.device)
+    return point_xy, box_xyxy, prompt_valid
 
 
 # =============================================================================
@@ -1217,14 +1322,24 @@ class FrozenSAM2Guidance(nn.Module):
       - box prompts are passed through ``boxes=box_xyxy``
       - point+box prompts pass both arguments at the same time
 
-    No half-pixel offset is added here. Coordinates are expected to be in the
-    same pixel-coordinate convention as the predictor input prompts.
+    If several disconnected coarse-mask components are detected, each component
+    prompt is decoded separately and the final logit map is the pixel-wise maximum
+    over all component-specific MedSAM2 predictions. This makes thresholding the
+    combined logits equivalent to a union/OR of the individual binary masks.
     """
 
     def __init__(self, sam2_model: nn.Module):
         super().__init__()
         self.sam2 = sam2_model
         freeze_module(self.sam2)
+
+    @staticmethod
+    def _num_prompts(point_xy: Optional[torch.Tensor], box_xyxy: Optional[torch.Tensor]) -> int:
+        if point_xy is not None and point_xy.ndim == 3:
+            return int(point_xy.shape[1])
+        if box_xyxy is not None and box_xyxy.ndim == 3:
+            return int(box_xyxy.shape[1])
+        return 1
 
     def _make_points(self, point_xy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # point_xy: [B, 1, 2] or [B, 2], xy pixel coordinates.
@@ -1240,18 +1355,23 @@ class FrozenSAM2Guidance(nn.Module):
         # box_xyxy: [B, 4] or [B, 1, 4], xyxy pixel coordinates.
         if box_xyxy.ndim == 3:
             if box_xyxy.shape[1] != 1:
-                raise NotImplementedError("FrozenSAM2Guidance currently supports one box per image.")
+                raise ValueError(
+                    "_make_boxes expects one box per image. Multi-component boxes are split "
+                    "before calling this helper."
+                )
             box_xyxy = box_xyxy[:, 0, :]
         if box_xyxy.ndim != 2 or box_xyxy.shape[-1] != 4:
             raise ValueError(f"Expected box_xyxy with shape [B, 4] or [B, 1, 4], got {tuple(box_xyxy.shape)}")
         return box_xyxy
 
-    def decode(self, image: torch.Tensor, *, point_xy: Optional[torch.Tensor] = None, box_xyxy: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if point_xy is None and box_xyxy is None:
-            raise ValueError("Need point_xy or box_xyxy")
-        input_hw = image.shape[-2:]
-        feats = build_sam2_image_feature_dict(self.sam2, image)
-
+    def _decode_single_prompt(
+        self,
+        feats: Dict[str, List[torch.Tensor] | torch.Tensor],
+        input_hw: Tuple[int, int],
+        *,
+        point_xy: Optional[torch.Tensor] = None,
+        box_xyxy: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         points = self._make_points(point_xy) if point_xy is not None else None
         boxes = self._make_boxes(box_xyxy) if box_xyxy is not None else None
 
@@ -1275,13 +1395,71 @@ class FrozenSAM2Guidance(nn.Module):
         low_res_masks = decoder_out[0]
         if low_res_masks.ndim == 3:
             low_res_masks = low_res_masks[:, None]
-        # Keep the first mask channel when a fork still returns multiple masks.
         logits = low_res_masks[:, :1]
         logits = F.interpolate(logits, size=input_hw, mode="bilinear", align_corners=False)
         return logits
 
-    def forward(self, image: torch.Tensor, point_xy: torch.Tensor, box_xyxy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.decode(image, point_xy=point_xy), self.decode(image, box_xyxy=box_xyxy)
+    def decode(
+        self,
+        image: torch.Tensor,
+        *,
+        point_xy: Optional[torch.Tensor] = None,
+        box_xyxy: Optional[torch.Tensor] = None,
+        prompt_valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if point_xy is None and box_xyxy is None:
+            raise ValueError("Need point_xy or box_xyxy")
+
+        input_hw = image.shape[-2:]
+        feats = build_sam2_image_feature_dict(self.sam2, image)
+        B = int(image.shape[0])
+        n_prompts = self._num_prompts(point_xy, box_xyxy)
+
+        if prompt_valid is None:
+            prompt_valid = torch.ones(B, n_prompts, dtype=image.dtype, device=image.device)
+        else:
+            if prompt_valid.ndim == 1:
+                prompt_valid = prompt_valid[:, None]
+            prompt_valid = prompt_valid.to(device=image.device, dtype=image.dtype)
+            if prompt_valid.shape[1] != n_prompts:
+                if prompt_valid.shape[1] == 1:
+                    prompt_valid = prompt_valid.expand(B, n_prompts)
+                else:
+                    raise ValueError(
+                        f"prompt_valid has shape {tuple(prompt_valid.shape)}, but n_prompts={n_prompts}"
+                    )
+
+        # Single-prompt fast path.
+        if n_prompts == 1:
+            logits = self._decode_single_prompt(feats, input_hw, point_xy=point_xy, box_xyxy=box_xyxy)
+            valid = prompt_valid[:, 0].view(B, 1, 1, 1)
+            return torch.where(valid > 0.5, logits, torch.full_like(logits, -30.0))
+
+        # Multi-component path: decode each prompt independently and combine by max.
+        # This approximates the union of the component-specific masks while keeping a
+        # single [B,1,H,W] logit tensor for the rest of the training/eval code.
+        all_logits: List[torch.Tensor] = []
+        for j in range(n_prompts):
+            point_j = point_xy[:, j : j + 1, :] if point_xy is not None and point_xy.ndim == 3 else point_xy
+            box_j = box_xyxy[:, j : j + 1, :] if box_xyxy is not None and box_xyxy.ndim == 3 else box_xyxy
+            logits_j = self._decode_single_prompt(feats, input_hw, point_xy=point_j, box_xyxy=box_j)
+            valid_j = prompt_valid[:, j].view(B, 1, 1, 1)
+            logits_j = torch.where(valid_j > 0.5, logits_j, torch.full_like(logits_j, -30.0))
+            all_logits.append(logits_j)
+
+        return torch.stack(all_logits, dim=0).amax(dim=0)
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        point_xy: torch.Tensor,
+        box_xyxy: torch.Tensor,
+        prompt_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self.decode(image, point_xy=point_xy, prompt_valid=prompt_valid),
+            self.decode(image, box_xyxy=box_xyxy, prompt_valid=prompt_valid),
+        )
 
 
 class PromptProposalModel(nn.Module):
@@ -1302,6 +1480,8 @@ class PromptProposalModel(nn.Module):
         coarse_prompt_box_std_scale: float = 2.0,
         coarse_prompt_min_box_size_px: int = 3,
         coarse_prompt_box_pad_px: int = 0,
+        coarse_hard_max_components: int = 3,
+        coarse_hard_min_component_area: int = 1,
         sam_guided_modes: Sequence[str] = ("point", "box"),
     ):
         super().__init__()
@@ -1313,6 +1493,8 @@ class PromptProposalModel(nn.Module):
         self.coarse_prompt_box_std_scale = float(coarse_prompt_box_std_scale)
         self.coarse_prompt_min_box_size_px = int(coarse_prompt_min_box_size_px)
         self.coarse_prompt_box_pad_px = int(coarse_prompt_box_pad_px)
+        self.coarse_hard_max_components = int(coarse_hard_max_components)
+        self.coarse_hard_min_component_area = int(coarse_hard_min_component_area)
         self.sam_guided_modes = tuple(str(m) for m in sam_guided_modes)
         bad_modes = sorted(set(self.sam_guided_modes) - {"point", "box", "point+box"})
         if bad_modes:
@@ -1372,6 +1554,9 @@ class PromptProposalModel(nn.Module):
         # to MedSAM2 are derived from the predicted coarse mask.
         out["point_xy_head"] = out["point_xy"]
         out["box_xyxy_head"] = out["box_xyxy"]
+        out["prompt_valid"] = torch.ones(
+            out["point_xy"].shape[:2], dtype=out["point_xy"].dtype, device=out["point_xy"].device
+        )
         if self.prompt_source == "coarse-soft":
             point_xy, box_xyxy = soft_prompts_from_coarse_logits(
                 out["coarse_logits"],
@@ -1381,15 +1566,21 @@ class PromptProposalModel(nn.Module):
             )
             out["point_xy"] = point_xy
             out["box_xyxy"] = box_xyxy
+            out["prompt_valid"] = torch.ones(
+                point_xy.shape[:2], dtype=point_xy.dtype, device=point_xy.device
+            )
         elif self.prompt_source == "coarse-hard":
-            point_xy, box_xyxy = hard_prompts_from_coarse_logits(
+            point_xy, box_xyxy, prompt_valid = hard_prompts_from_coarse_logits(
                 out["coarse_logits"],
                 threshold=self.coarse_prompt_threshold,
                 min_box_size_px=self.coarse_prompt_min_box_size_px,
                 box_pad_px=self.coarse_prompt_box_pad_px,
+                max_components=self.coarse_hard_max_components,
+                min_component_area=self.coarse_hard_min_component_area,
             )
             out["point_xy"] = point_xy
             out["box_xyxy"] = box_xyxy
+            out["prompt_valid"] = prompt_valid
         elif self.prompt_source != "heads":
             raise ValueError(f"Unknown prompt_source={self.prompt_source!r}")
 
@@ -1397,15 +1588,21 @@ class PromptProposalModel(nn.Module):
             # Compute only the requested frozen-SAM2 guided modes. This keeps the
             # training cost controllable and allows optimizing the exact inference
             # prompt mode of interest (point, box, or point+box).
+            prompt_valid = out.get("prompt_valid")
             if "point" in self.sam_guided_modes:
-                out["sam_point_logits"] = self.sam_guidance.decode(x, point_xy=out["point_xy"])
+                out["sam_point_logits"] = self.sam_guidance.decode(
+                    x, point_xy=out["point_xy"], prompt_valid=prompt_valid
+                )
             if "box" in self.sam_guided_modes:
-                out["sam_box_logits"] = self.sam_guidance.decode(x, box_xyxy=out["box_xyxy"])
+                out["sam_box_logits"] = self.sam_guidance.decode(
+                    x, box_xyxy=out["box_xyxy"], prompt_valid=prompt_valid
+                )
             if "point+box" in self.sam_guided_modes:
                 out["sam_point_box_logits"] = self.sam_guidance.decode(
                     x,
                     point_xy=out["point_xy"],
                     box_xyxy=out["box_xyxy"],
+                    prompt_valid=prompt_valid,
                 )
         return out
 
@@ -1764,8 +1961,14 @@ def predict_case_positive_slices(
                     if key in outputs:
                         logits_map[key.replace("_logits", "")] = outputs[key]
 
-            prompt_points = outputs["point_xy"].detach().float().cpu().numpy()[:, 0]
-            prompt_boxes = outputs["box_xyxy"].detach().float().cpu().numpy()[:, 0]
+            prompt_points_all = outputs["point_xy"].detach().float().cpu().numpy()
+            prompt_boxes_all = outputs["box_xyxy"].detach().float().cpu().numpy()
+            if "prompt_valid" in outputs:
+                prompt_valid_all = outputs["prompt_valid"].detach().float().cpu().numpy()
+            else:
+                prompt_valid_all = np.ones(prompt_points_all.shape[:2], dtype=np.float32)
+            prompt_points = prompt_points_all[:, 0]
+            prompt_boxes = prompt_boxes_all[:, 0]
 
             for key, logits in logits_map.items():
                 probs = torch.sigmoid(logits).detach().float().cpu().numpy()[:, 0]
@@ -1788,6 +1991,9 @@ def predict_case_positive_slices(
                     "pred_box_y1": float(prompt_boxes[i, 1]),
                     "pred_box_x2": float(prompt_boxes[i, 2]),
                     "pred_box_y2": float(prompt_boxes[i, 3]),
+                    "n_detected_prompts": int(np.round(prompt_valid_all[i]).astype(np.int32).sum()),
+                    "pred_points_xy_all": json.dumps(prompt_points_all[i][prompt_valid_all[i] > 0.5].tolist()),
+                    "pred_boxes_xyxy_all": json.dumps(prompt_boxes_all[i][prompt_valid_all[i] > 0.5].tolist()),
                 }
                 for key in logits_map.keys():
                     m = segmentation_metrics(gt_slice, pred_volumes[key][z], spacing_yx)
@@ -1908,6 +2114,8 @@ def build_model(args: argparse.Namespace, device: torch.device) -> PromptProposa
         coarse_prompt_box_std_scale=args.coarse_prompt_box_std_scale,
         coarse_prompt_min_box_size_px=args.coarse_prompt_min_box_size_px,
         coarse_prompt_box_pad_px=args.coarse_prompt_box_pad_px,
+        coarse_hard_max_components=args.coarse_hard_max_components,
+        coarse_hard_min_component_area=args.coarse_hard_min_component_area,
         sam_guided_modes=args.sam_guided_modes,
     ).to(device)
     return model
@@ -2438,7 +2646,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Which prompts are sent to frozen MedSAM2. 'heads' uses the learned point/box heads. "
             "'coarse-soft' derives differentiable moment-based point/box prompts from the coarse mask. "
-            "'coarse-hard' thresholds the coarse mask and extracts the largest component/bbox; this is not differentiable."
+            "'coarse-hard' thresholds the coarse mask, extracts one prompt per connected component, and combines the component-wise MedSAM2 outputs; this is not differentiable."
         ),
     )
     p.add_argument("--supervise-derived-prompts", action=argparse.BooleanOptionalAction, default=True,
@@ -2447,6 +2655,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--coarse-prompt-box-std-scale", type=float, default=2.0, help="Box half-size multiplier for --prompt-source coarse-soft.")
     p.add_argument("--coarse-prompt-min-box-size-px", type=int, default=3, help="Minimum derived prompt-box side length.")
     p.add_argument("--coarse-prompt-box-pad-px", type=int, default=0, help="Extra padding in pixels around coarse-derived prompt boxes.")
+    p.add_argument(
+        "--coarse-hard-max-components",
+        type=int,
+        default=3,
+        help=(
+            "For --prompt-source coarse-hard, maximum number of disconnected predicted blobs/nodules "
+            "to convert into separate prompts per image. Each component is decoded separately by frozen MedSAM2, "
+            "then predictions are combined."
+        ),
+    )
+    p.add_argument(
+        "--coarse-hard-min-component-area",
+        type=int,
+        default=1,
+        help="For --prompt-source coarse-hard, ignore connected components smaller than this many pixels.",
+    )
 
     # Image/slice setup
     p.add_argument("--use-triplet-channels", action=argparse.BooleanOptionalAction, default=True)
@@ -2575,6 +2799,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--coarse-prompt-min-box-size-px must be >= 1")
     if args.coarse_prompt_box_pad_px < 0:
         raise ValueError("--coarse-prompt-box-pad-px must be >= 0")
+    if args.coarse_hard_max_components < 1:
+        raise ValueError("--coarse-hard-max-components must be >= 1")
+    if args.coarse_hard_min_component_area < 1:
+        raise ValueError("--coarse-hard-min-component-area must be >= 1")
     if args.coarse_prompt_box_std_scale <= 0:
         raise ValueError("--coarse-prompt-box-std-scale must be > 0")
     if not (0.0 <= args.coarse_prompt_threshold <= 1.0):
