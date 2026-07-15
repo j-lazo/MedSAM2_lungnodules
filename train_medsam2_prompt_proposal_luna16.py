@@ -918,6 +918,7 @@ class ProposalHeads(nn.Module):
         dropout: float = 0.0,
         prompt_head_type: str = "mlp",
         spatial_head_use_pyramid: bool = False,
+        prompt_head_use_coarse_probs: bool = True,
         spatial_head_pyramid_levels: int = 3,
         spatial_head_temperature: float = 0.25,
         spatial_head_detach_coarse_probs: bool = False,
@@ -934,6 +935,7 @@ class ProposalHeads(nn.Module):
         if self.prompt_head_type not in {"mlp", "spatial"}:
             raise ValueError("prompt_head_type must be 'mlp' or 'spatial'")
         self.spatial_head_use_pyramid = bool(spatial_head_use_pyramid)
+        self.prompt_head_use_coarse_probs = bool(prompt_head_use_coarse_probs)
         self.spatial_head_pyramid_levels = max(1, int(spatial_head_pyramid_levels))
         self.spatial_head_temperature = float(max(spatial_head_temperature, 1e-4))
         self.spatial_head_detach_coarse_probs = bool(spatial_head_detach_coarse_probs)
@@ -968,7 +970,7 @@ class ProposalHeads(nn.Module):
             self.pool = nn.Identity()
             self.point_mlp = nn.Identity()
             self.box_mlp = nn.Identity()
-            # Input is [feat_full, sigmoid(coarse_logits), x_coord, y_coord]
+            # Input is [feat_full, optional sigmoid(coarse_logits), x_coord, y_coord]
             # plus optional FPN fused pyramid levels. LazyConv2d lets the same
             # code work whether pyramid features are concatenated or not.
             self.spatial_prompt_head = nn.Sequential(
@@ -1024,10 +1026,11 @@ class ProposalHeads(nn.Module):
         B = int(feat_full.shape[0])
         prompt_inputs: List[torch.Tensor] = [feat_full]
 
-        coarse_probs = torch.sigmoid(coarse_logits)
-        if self.spatial_head_detach_coarse_probs:
-            coarse_probs = coarse_probs.detach()
-        prompt_inputs.append(coarse_probs)
+        if self.prompt_head_use_coarse_probs:
+            coarse_probs = torch.sigmoid(coarse_logits)
+            if self.spatial_head_detach_coarse_probs:
+                coarse_probs = coarse_probs.detach()
+            prompt_inputs.append(coarse_probs)
         prompt_inputs.append(self._coord_maps(B, H, W, feat_full.device, feat_full.dtype))
 
         if self.spatial_head_use_pyramid and pyramid_features:
@@ -1626,6 +1629,7 @@ class PromptProposalModel(nn.Module):
         coarse_hard_min_component_area: int = 1,
         prompt_head_type: str = "mlp",
         spatial_head_use_pyramid: bool = False,
+        prompt_head_use_coarse_probs: bool = True,
         spatial_head_pyramid_levels: int = 3,
         spatial_head_temperature: float = 0.25,
         spatial_head_detach_coarse_probs: bool = False,
@@ -1645,6 +1649,7 @@ class PromptProposalModel(nn.Module):
         self.coarse_hard_min_component_area = int(coarse_hard_min_component_area)
         self.prompt_head_type = str(prompt_head_type)
         self.spatial_head_use_pyramid = bool(spatial_head_use_pyramid)
+        self.prompt_head_use_coarse_probs = bool(prompt_head_use_coarse_probs)
         self.spatial_head_pyramid_levels = int(spatial_head_pyramid_levels)
         self.spatial_head_temperature = float(spatial_head_temperature)
         self.spatial_head_detach_coarse_probs = bool(spatial_head_detach_coarse_probs)
@@ -1692,6 +1697,7 @@ class PromptProposalModel(nn.Module):
             dropout=decoder_dropout,
             prompt_head_type=self.prompt_head_type,
             spatial_head_use_pyramid=self.spatial_head_use_pyramid,
+            prompt_head_use_coarse_probs=self.prompt_head_use_coarse_probs,
             spatial_head_pyramid_levels=self.spatial_head_pyramid_levels,
             spatial_head_temperature=self.spatial_head_temperature,
             spatial_head_detach_coarse_probs=self.spatial_head_detach_coarse_probs,
@@ -1861,7 +1867,12 @@ def compute_losses(outputs: Dict[str, torch.Tensor], batch: Dict, args: argparse
         args.prompt_source == "heads"
         or (args.prompt_source == "coarse-soft" and args.supervise_derived_prompts)
     )
-    total = args.lambda_coarse * coarse
+    # Optionally train without the coarse-mask objective. We still compute/log
+    # the coarse loss and coarse Dice for diagnostics, but it contributes to the
+    # optimized objective only when --train-coarse-mask is enabled.
+    total = coarse * 0.0
+    if getattr(args, "train_coarse_mask", True):
+        total = total + args.lambda_coarse * coarse
     if supervise_prompts:
         total = total + args.lambda_point * point + args.lambda_box_l1 * box_l1 + args.lambda_box_giou * box_giou
     logs: Dict[str, float] = {
@@ -2021,7 +2032,19 @@ def save_checkpoint(
 
 def load_checkpoint(model: nn.Module, ckpt_path: Path, device: torch.device) -> Dict:
     ckpt = torch.load(str(ckpt_path), map_location=device)
-    missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+    state = ckpt["model_state"]
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped_shape = []
+    for k, v in state.items():
+        if k in model_state and tuple(model_state[k].shape) != tuple(v.shape):
+            skipped_shape.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+            continue
+        compatible_state[k] = v
+    missing, unexpected = model.load_state_dict(compatible_state, strict=False)
+    if skipped_shape:
+        preview = ", ".join([f"{k}: ckpt{src}->model{dst}" for k, src, dst in skipped_shape[:5]])
+        print(f"WARNING skipped {len(skipped_shape)} checkpoint keys with incompatible shapes: {preview}{'...' if len(skipped_shape) > 5 else ''}")
     if missing:
         print(f"WARNING missing keys while loading checkpoint: {missing[:10]}{'...' if len(missing) > 10 else ''}")
     if unexpected:
@@ -2280,6 +2303,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> PromptProposa
         coarse_hard_min_component_area=args.coarse_hard_min_component_area,
         prompt_head_type=args.prompt_head_type,
         spatial_head_use_pyramid=args.spatial_head_use_pyramid,
+        prompt_head_use_coarse_probs=args.prompt_head_use_coarse_probs,
         spatial_head_pyramid_levels=args.spatial_head_pyramid_levels,
         spatial_head_temperature=args.spatial_head_temperature,
         spatial_head_detach_coarse_probs=args.spatial_head_detach_coarse_probs,
@@ -2411,9 +2435,9 @@ def describe_optimizer_param_groups(optimizer: torch.optim.Optimizer) -> None:
         print(f"  optimizer group {group.get('name', 'unnamed')}: lr={group['lr']:.3e}, params={n_params:,}")
 
 
-def best_metric_value(val_log: Dict[str, float], args: argparse.Namespace) -> Tuple[float, bool]:
-    """Return (metric_value, maximize) for checkpoint selection."""
-    metric = str(args.best_metric)
+def best_metric_value_by_name(val_log: Dict[str, float], metric: str) -> Tuple[float, bool]:
+    """Return (metric_value, maximize) for a named validation metric."""
+    metric = str(metric)
     if metric == "val_loss":
         return float(val_log["loss"]), False
     key_map = {
@@ -2431,7 +2455,12 @@ def best_metric_value(val_log: Dict[str, float], args: argparse.Namespace) -> Tu
             if float(val_log.get(k, 0.0)) > 0.0
         ]
         return (float(np.mean(vals)) if vals else 0.0), True
-    raise ValueError(f"Unknown --best-metric {metric!r}")
+    raise ValueError(f"Unknown metric {metric!r}")
+
+
+def best_metric_value(val_log: Dict[str, float], args: argparse.Namespace) -> Tuple[float, bool]:
+    """Return (metric_value, maximize) for checkpoint selection."""
+    return best_metric_value_by_name(val_log, str(args.best_metric))
 
 
 def is_better_metric(value: float, best: float, maximize: bool, min_delta: float) -> bool:
@@ -2632,19 +2661,23 @@ def train(args: argparse.Namespace) -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and args.amp_dtype == "fp16"))
 
-    _, maximize_best_metric = best_metric_value({"loss": 0.0}, args) if args.best_metric == "val_loss" else (0.0, True)
-    best_val = -float("inf") if maximize_best_metric else float("inf")
+    active_best_metric = str(args.best_metric)
+    best_val = -float("inf")
     bad_epochs = 0
     metrics_rows: List[Dict] = []
+    metric_switched = False
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     print(f"Training prompt-proposal model. Output: {out_dir}")
     print(
         f"Proposal backbone: {args.proposal_backbone}; decoder={args.decoder_type}; "
         f"prompt_source={args.prompt_source}; prompt_head_type={args.prompt_head_type}; "
-        f"spatial_use_pyramid={args.spatial_head_use_pyramid}; sam_guided_loss={args.sam_guided_loss}; "
+        f"spatial_use_pyramid={args.spatial_head_use_pyramid}; "
+        f"prompt_use_coarse_probs={args.prompt_head_use_coarse_probs}; "
+        f"train_coarse_mask={args.train_coarse_mask}; sam_guided_loss={args.sam_guided_loss}; "
         f"sam_guided_modes={args.sam_guided_modes}; curriculum={args.curriculum_training}; "
-        f"finetune_mode={args.finetune_mode}; best_metric={args.best_metric}"
+        f"finetune_mode={args.finetune_mode}; best_metric={args.best_metric}; "
+        f"adaptive_best_after={args.best_metric_after_threshold}"
     )
     print(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
     describe_optimizer_param_groups(optimizer)
@@ -2660,7 +2693,7 @@ def train(args: argparse.Namespace) -> None:
             current_stage_index = stage_index
             current_stage_name = str(stage["stage_name"])
             bad_epochs = 0
-            _, maximize_best_metric = best_metric_value({"loss": 0.0}, args) if args.best_metric == "val_loss" else (0.0, True)
+            _, maximize_best_metric = best_metric_value_by_name({"loss": 0.0}, active_best_metric) if active_best_metric == "val_loss" else (0.0, True)
             best_val = -float("inf") if maximize_best_metric else float("inf")
             stage_best_initialized = False
             print(
@@ -2730,9 +2763,28 @@ def train(args: argparse.Namespace) -> None:
         )
 
         save_checkpoint(out_dir / "last_model.pt", model, optimizer, epoch, best_val, args)
-        val_metric, maximize_best_metric = best_metric_value(val_log, args)
-        row["best_metric_name"] = args.best_metric
+
+        # Optional validation-driven metric switch. Example: select by coarse DSC
+        # until val_DSC_coarse reaches 0.70, then switch checkpointing/early stop
+        # to val_DSC_sam_point_box or val_DSC_sam_mean.
+        if args.best_metric_switch_threshold is not None and not metric_switched:
+            switch_value, _ = best_metric_value_by_name(val_log, args.best_metric_switch_source)
+            if switch_value >= float(args.best_metric_switch_threshold):
+                active_best_metric = str(args.best_metric_after_threshold)
+                metric_switched = True
+                bad_epochs = 0
+                best_val_init, maximize_best_metric = best_metric_value_by_name(val_log, active_best_metric)
+                best_val = -float("inf") if maximize_best_metric else float("inf")
+                stage_best_initialized = False
+                print(
+                    f"  adaptive best metric switch: {args.best_metric_switch_source}={switch_value:.5f} "
+                    f">= {float(args.best_metric_switch_threshold):.5f}; now selecting by {active_best_metric}"
+                )
+
+        val_metric, maximize_best_metric = best_metric_value_by_name(val_log, active_best_metric)
+        row["best_metric_name"] = active_best_metric
         row["best_metric_value"] = float(val_metric)
+        row["metric_switched"] = bool(metric_switched)
         # Rewrite metrics after adding best-selection fields.
         pd.DataFrame(metrics_rows).to_csv(out_dir / "metrics.csv", index=False)
         with open(out_dir / "metrics.json", "w") as f:
@@ -2744,13 +2796,13 @@ def train(args: argparse.Namespace) -> None:
             stage_best_initialized = True
             save_checkpoint(out_dir / "best_model.pt", model, optimizer, epoch, best_val, args)
             save_checkpoint(out_dir / f"best_model_stage{stage_index}_{current_stage_name}.pt", model, optimizer, epoch, best_val, args)
-            print(f"  reset stage best at {args.best_metric}={best_val:.5f} and saved best_model.pt")
+            print(f"  reset stage best at {active_best_metric}={best_val:.5f} and saved best_model.pt")
         elif is_better_metric(val_metric, best_val, maximize_best_metric, args.min_delta):
             best_val = val_metric
             bad_epochs = 0
             save_checkpoint(out_dir / "best_model.pt", model, optimizer, epoch, best_val, args)
             save_checkpoint(out_dir / f"best_model_stage{stage_index}_{current_stage_name}.pt", model, optimizer, epoch, best_val, args)
-            print(f"  saved best_model.pt with stage {args.best_metric}={best_val:.5f}")
+            print(f"  saved best_model.pt with stage {active_best_metric}={best_val:.5f}")
         else:
             bad_epochs += 1
             if args.patience > 0 and bad_epochs >= args.patience:
@@ -2836,6 +2888,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="With --prompt-head-type spatial and --decoder-type fpn, concatenate the fused FPN levels into the spatial prompt CNN.",
     )
+    p.add_argument(
+        "--prompt-head-use-coarse-probs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "With --prompt-head-type spatial, include sigmoid(coarse_logits) as an input to the point/box prompt CNN. "
+            "Disable this for a prompt-only model that does not rely on the coarse-mask branch."
+        ),
+    )
     p.add_argument("--spatial-head-pyramid-levels", type=int, default=3, help="Number of fused FPN levels to concatenate in the spatial prompt CNN.")
     p.add_argument("--spatial-head-temperature", type=float, default=0.25, help="Soft-argmax temperature for the point heatmap. Smaller values make the point sharper.")
     p.add_argument(
@@ -2898,6 +2959,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--sam-bce-weight", type=float, default=0.5)
     p.add_argument("--sam-dice-weight", type=float, default=0.5)
     p.add_argument("--lambda-coarse", type=float, default=1.0)
+    p.add_argument(
+        "--train-coarse-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Include the coarse-mask Dice/BCE objective in the optimized loss. "
+            "Use --no-train-coarse-mask together with --no-prompt-head-use-coarse-probs for a prompt-only model."
+        ),
+    )
     p.add_argument("--lambda-point", type=float, default=1.0)
     p.add_argument("--lambda-box-l1", type=float, default=2.0)
     p.add_argument("--lambda-box-giou", type=float, default=1.0)
@@ -2924,11 +2994,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--coarse-head-lr-scale", type=float, default=1.0, help="LR multiplier for the coarse mask head. Use e.g. 0.05-0.2 to keep the coarse mask changing slowly.")
     p.add_argument("--refine-lr-scale", type=float, default=1.0, help="LR multiplier for the shared ProposalHeads refinement block.")
     p.add_argument("--decoder-lr-scale", type=float, default=1.0, help="LR multiplier for proposal_decoder when it is trainable.")
+    metric_choices = ["val_loss", "val_DSC_coarse", "val_DSC_sam_point", "val_DSC_sam_box", "val_DSC_sam_point_box", "val_DSC_sam_mean"]
     p.add_argument(
         "--best-metric",
-        choices=["val_loss", "val_DSC_coarse", "val_DSC_sam_point", "val_DSC_sam_box", "val_DSC_sam_point_box", "val_DSC_sam_mean"],
+        choices=metric_choices,
         default="val_loss",
         help="Metric used to save best_model.pt and early-stop. DSC metrics are maximized; val_loss is minimized.",
+    )
+    p.add_argument(
+        "--best-metric-switch-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Optional adaptive checkpointing: when --best-metric-switch-source reaches this value, "
+            "switch checkpoint selection/early stopping to --best-metric-after-threshold."
+        ),
+    )
+    p.add_argument(
+        "--best-metric-switch-source",
+        choices=["val_DSC_coarse", "val_DSC_sam_point", "val_DSC_sam_box", "val_DSC_sam_point_box", "val_DSC_sam_mean"],
+        default="val_DSC_coarse",
+        help="Validation metric monitored for the adaptive best-metric switch.",
+    )
+    p.add_argument(
+        "--best-metric-after-threshold",
+        choices=metric_choices,
+        default=None,
+        help="Metric used after --best-metric-switch-source reaches --best-metric-switch-threshold.",
     )
 
     # Curriculum / staged training
@@ -3016,6 +3108,10 @@ def validate_args(args: argparse.Namespace) -> None:
         print("NOTE: --spatial-head-use-pyramid only has an effect with --decoder-type fpn")
     if args.prompt_head_type == "spatial" and args.prompt_source != "heads":
         print("NOTE: --prompt-head-type spatial creates spatial learned heads, but prompt_source will overwrite prompts unless --prompt-source heads is used.")
+    if (not args.train_coarse_mask) and args.prompt_source != "heads":
+        raise ValueError("--no-train-coarse-mask is intended for --prompt-source heads; coarse-soft/coarse-hard need a trained coarse mask.")
+    if (not args.train_coarse_mask) and args.prompt_head_type == "spatial" and args.prompt_head_use_coarse_probs:
+        print("WARNING: --no-train-coarse-mask but --prompt-head-use-coarse-probs is enabled. The spatial prompt head will still depend on unsupervised coarse logits; consider --no-prompt-head-use-coarse-probs.")
     if args.prompt_source == "coarse-hard" and args.supervise_derived_prompts:
         print("NOTE: --supervise-derived-prompts has no effect with --prompt-source coarse-hard because hard extraction is non-differentiable.")
     if args.coarse_prompt_min_box_size_px < 1:
@@ -3049,19 +3145,29 @@ def validate_args(args: argparse.Namespace) -> None:
     ]:
         if getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
-    if args.coarse_bce_weight + args.coarse_dice_weight <= 0:
-        raise ValueError("At least one coarse mask loss weight must be positive")
+    if args.train_coarse_mask and args.coarse_bce_weight + args.coarse_dice_weight <= 0:
+        raise ValueError("At least one coarse mask loss weight must be positive when --train-coarse-mask is enabled")
     if args.sam_guided_loss and args.sam_bce_weight + args.sam_dice_weight <= 0:
         raise ValueError("At least one SAM mask loss weight must be positive when --sam-guided-loss is enabled")
     for name in ["prompt_head_lr_scale", "coarse_head_lr_scale", "refine_lr_scale", "decoder_lr_scale"]:
         if getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
+    if args.best_metric_switch_threshold is not None and args.best_metric_after_threshold is None:
+        raise ValueError("--best-metric-switch-threshold requires --best-metric-after-threshold")
+    if args.best_metric_switch_threshold is not None and args.best_metric_switch_threshold < 0:
+        raise ValueError("--best-metric-switch-threshold must be non-negative")
     if args.best_metric == "val_DSC_sam_point_box" and "point+box" not in args.sam_guided_modes:
         print("WARNING: --best-metric val_DSC_sam_point_box requires --sam-guided-modes point+box; otherwise it will remain 0.")
     if args.best_metric == "val_DSC_sam_point" and "point" not in args.sam_guided_modes:
         print("WARNING: --best-metric val_DSC_sam_point requires --sam-guided-modes point; otherwise it will remain 0.")
     if args.best_metric == "val_DSC_sam_box" and "box" not in args.sam_guided_modes:
         print("WARNING: --best-metric val_DSC_sam_box requires --sam-guided-modes box; otherwise it will remain 0.")
+    if args.best_metric_after_threshold == "val_DSC_sam_point_box" and "point+box" not in args.sam_guided_modes:
+        print("WARNING: --best-metric-after-threshold val_DSC_sam_point_box requires --sam-guided-modes point+box; otherwise it will remain 0.")
+    if args.best_metric_after_threshold == "val_DSC_sam_point" and "point" not in args.sam_guided_modes:
+        print("WARNING: --best-metric-after-threshold val_DSC_sam_point requires --sam-guided-modes point; otherwise it will remain 0.")
+    if args.best_metric_after_threshold == "val_DSC_sam_box" and "box" not in args.sam_guided_modes:
+        print("WARNING: --best-metric-after-threshold val_DSC_sam_box requires --sam-guided-modes box; otherwise it will remain 0.")
     if args.proposal_backbone == "unet" and args.decoder_type != "fpn":
         print("NOTE: --decoder-type is ignored with --proposal-backbone unet")
     if args.aug_scale_min <= 0 or args.aug_scale_max <= 0 or args.aug_scale_min > args.aug_scale_max:
